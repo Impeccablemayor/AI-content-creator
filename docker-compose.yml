@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: mayorx-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mayorx_content_engine
+      POSTGRES_USER: mayorx
+      POSTGRES_PASSWORD: mayorx_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - mayorx_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mayorx -d mayorx_content_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    container_name: mayorx-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - mayorx_redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mayorx_postgres_data:
+  mayorx_redis_data:
