@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
+using System.Text.Json;
 using Api.Application.AI;
 using Api.Application.AI.Prompts;
 using Api.Application.Authentication;
@@ -17,6 +18,17 @@ namespace Api.Tests;
 
 public sealed class ContentIdeaTests
 {
+    [Fact]
+    public void Generate_request_accepts_platform_name_as_string()
+    {
+        var request = JsonSerializer.Deserialize<GenerateContentIdeasRequest>(
+            """{"platform":"LinkedIn"}""",
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.NotNull(request);
+        Assert.Equal(ContentPlatform.LinkedIn, request.Platform);
+    }
+
     [Fact]
     public void Overall_score_uses_application_weights_and_neutral_freshness()
     {
@@ -190,7 +202,29 @@ public sealed class ContentIdeaTests
         Assert.Contains("LinkedIn", aiProvider.UserPrompt);
         Assert.Contains("Testing", aiProvider.UserPrompt);
         Assert.Contains("0-3 highly relevant hashtags", aiProvider.UserPrompt);
+        Assert.Same(ContentIdeaResponseSchema.Value, aiProvider.ResponseSchema);
         Assert.Equal(workspaceId, (await dbContext.ContentIdeas.SingleAsync()).WorkspaceId);
+    }
+
+    [Fact]
+    public void Content_post_shaped_response_is_rejected_by_the_idea_validator()
+    {
+        var response = JsonSerializer.Deserialize<ContentIdeaGenerationResult>(
+            """
+            {
+              "platform": "LinkedIn",
+              "content": "Example post content.",
+              "hook": "Example hook.",
+              "callToAction": "What do you think?",
+              "hashtags": ["#SoftwareEngineering"],
+              "contentType": "Educational",
+              "storytellingStructure": "Hook to takeaway"
+            }
+            """,
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.Throws<InvalidAiResponseException>(() =>
+            ContentIdeaGenerationValidator.ValidateAndNormalize(response, 1));
     }
 
     private static AppDbContext CreateDbContext() =>
@@ -246,12 +280,16 @@ public sealed class ContentIdeaTests
     {
         public string UserPrompt { get; private set; } = string.Empty;
 
+        public AiResponseSchema? ResponseSchema { get; private set; }
+
         public Task<string> GenerateAsync(
             string systemPrompt,
             string userPrompt,
+            AiResponseSchema responseSchema,
             CancellationToken cancellationToken = default)
         {
             UserPrompt = userPrompt;
+            ResponseSchema = responseSchema;
             return Task.FromResult(response);
         }
     }

@@ -22,7 +22,7 @@ public static class LocalDotEnvLoader
         var envFilePath = Path.Combine(repositoryRoot, ".env");
         if (File.Exists(envFilePath))
         {
-            DotNetEnv.Env.NoClobber().Load(envFilePath);
+            DotNetEnv.Env.Load(envFilePath);
         }
     }
 

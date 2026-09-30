@@ -7,16 +7,18 @@ namespace Api.Tests;
 public sealed class LocalDotEnvLoaderTests
 {
     [Fact]
-    public void Development_loads_root_dotenv_without_overriding_process_values()
+    public void Development_dotenv_overrides_process_values()
     {
         const string providerVariable = "AI__Provider";
         const string modelVariable = "AI__Model";
+        const string baseUrlVariable = "AI__BaseUrl";
         const string keyVariable = "AI__ApiKey";
         const string timeoutVariable = "AI__TimeoutSeconds";
         var previousValues = new Dictionary<string, string?>
         {
             [providerVariable] = Environment.GetEnvironmentVariable(providerVariable),
             [modelVariable] = Environment.GetEnvironmentVariable(modelVariable),
+            [baseUrlVariable] = Environment.GetEnvironmentVariable(baseUrlVariable),
             [keyVariable] = Environment.GetEnvironmentVariable(keyVariable),
             [timeoutVariable] = Environment.GetEnvironmentVariable(timeoutVariable)
         };
@@ -36,16 +38,22 @@ public sealed class LocalDotEnvLoaderTests
             Directory.CreateDirectory(startDirectory);
             File.WriteAllText(
                 Path.Combine(repositoryRoot, ".env"),
-                "AI__Provider=OpenAI\n" +
-                "AI__Model=gpt-4o-mini\n" +
+                "AI__Provider=Groq\n" +
+                "AI__Model=openai/gpt-oss-20b\n" +
+                "AI__BaseUrl=https://api.groq.com/openai/v1/\n" +
                 "AI__ApiKey=local-test-placeholder\n" +
                 "AI__TimeoutSeconds=45\n");
             Environment.SetEnvironmentVariable(providerVariable, "Unavailable");
+            Environment.SetEnvironmentVariable(modelVariable, "inherited-model");
+            Environment.SetEnvironmentVariable(baseUrlVariable, "https://inherited.invalid/v1/");
+            Environment.SetEnvironmentVariable(keyVariable, "inherited-test-placeholder");
+            Environment.SetEnvironmentVariable(timeoutVariable, "10");
 
             LocalDotEnvLoader.LoadIfPresent("Development", startDirectory);
 
-            Assert.Equal("Unavailable", Environment.GetEnvironmentVariable(providerVariable));
-            Assert.Equal("gpt-4o-mini", Environment.GetEnvironmentVariable(modelVariable));
+            Assert.Equal("Groq", Environment.GetEnvironmentVariable(providerVariable));
+            Assert.Equal("openai/gpt-oss-20b", Environment.GetEnvironmentVariable(modelVariable));
+            Assert.Equal("https://api.groq.com/openai/v1/", Environment.GetEnvironmentVariable(baseUrlVariable));
             Assert.Equal("local-test-placeholder", Environment.GetEnvironmentVariable(keyVariable));
             Assert.Equal("45", Environment.GetEnvironmentVariable(timeoutVariable));
 
@@ -57,8 +65,9 @@ public sealed class LocalDotEnvLoaderTests
                 .Get<AiOptions>();
 
             Assert.NotNull(options);
-            Assert.Equal("Unavailable", options.Provider);
-            Assert.Equal("gpt-4o-mini", options.Model);
+            Assert.Equal("Groq", options.Provider);
+            Assert.Equal("openai/gpt-oss-20b", options.Model);
+            Assert.Equal("https://api.groq.com/openai/v1/", options.BaseUrl);
             Assert.Equal("local-test-placeholder", options.ApiKey);
             Assert.Equal(45, options.TimeoutSeconds);
         }

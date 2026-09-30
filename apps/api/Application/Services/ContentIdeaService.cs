@@ -109,6 +109,7 @@ public sealed class ContentIdeaService : IContentIdeaService
         var generatedJson = await _aiProvider.GenerateAsync(
             ContentIdeaSystemPrompt.Value,
             prompt,
+            ContentIdeaResponseSchema.Value,
             cancellationToken);
 
         ContentIdeaGenerationResult? generated;

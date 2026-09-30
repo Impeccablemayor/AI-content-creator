@@ -1218,19 +1218,28 @@ Exact providers and models should remain configurable.
 
 # 43. Model Abstraction
 
-The application should use a provider abstraction.
+The application should use a provider abstraction. Provider selection belongs in
+configuration and dependency injection; business services must not branch on a
+vendor name.
 
 Conceptually:
 
 ```text
 IAIProvider
    │
-   ├── Provider A
-   ├── Provider B
-   └── Provider C
+   ├── GeminiProvider
+   └── OpenAI-compatible chat completions provider
+       ├── OpenAI
+       ├── Groq
+       └── OpenRouter
 ```
 
 This prevents the application from becoming tightly coupled to a single AI provider.
+
+The OpenAI-compatible provider uses the configured API base URL, model, and API
+key. It preserves structured JSON Schema output and the common chat-completions
+response contract. Groq is the initial compatible-provider configuration;
+OpenRouter can be selected by changing configuration only.
 
 The provider interface should support:
 
