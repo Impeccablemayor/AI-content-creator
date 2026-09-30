@@ -34,4 +34,8 @@ public interface IContentPostService
     Task<ContentPostResponse?> RejectAsync(
         Guid id,
         CancellationToken cancellationToken = default);
+
+    Task<ContentEvaluationResponse?> EvaluateAsync(
+        Guid id,
+        CancellationToken cancellationToken = default);
 }

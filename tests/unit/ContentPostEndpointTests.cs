@@ -67,6 +67,7 @@ public sealed class ContentPostEndpointTests
     [InlineData(nameof(ContentPostsController.Regenerate), "{id:guid}/regenerate")]
     [InlineData(nameof(ContentPostsController.Approve), "{id:guid}/approve")]
     [InlineData(nameof(ContentPostsController.Reject), "{id:guid}/reject")]
+    [InlineData(nameof(ContentPostsController.Evaluate), "{id:guid}/evaluate")]
     public void Post_actions_use_post_verbs_on_guarded_id_templates(string actionName, string expectedTemplate)
     {
         var action = GetActions()
@@ -179,8 +180,51 @@ public sealed class ContentPostEndpointTests
     }
 
     [Fact]
-    public void Update_contract_exposes_no_system_controlled_field()
+    public async Task Evaluate_returns_the_success_envelope_without_changing_status()
     {
+        var post = new ContentPostResponse { Id = Guid.NewGuid(), Status = "Draft" };
+        var evaluation = new ContentEvaluationResponse
+        {
+            ContentPostId = post.Id,
+            OverallScore = 88m,
+            Passed = true,
+            Recommendation = "MinorEdit",
+            PassThreshold = 70m
+        };
+        var controller = new ContentPostsController(new StubContentPostService
+        {
+            Single = post,
+            Evaluation = evaluation
+        });
+
+        var result = await controller.Evaluate(post.Id, CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var envelope = Assert.IsType<ApiResponse<ContentEvaluationResponse>>(ok.Value);
+        Assert.Equal("Content post evaluated successfully.", envelope.Message);
+        Assert.Same(evaluation, envelope.Data);
+        Assert.Equal("Draft", post.Status);
+    }
+
+    [Fact]
+    public async Task Evaluate_returns_404_for_an_unknown_or_foreign_post()
+    {
+        var controller = new ContentPostsController(new StubContentPostService
+        {
+            Single = null,
+            Evaluation = null
+        });
+
+        var result = await controller.Evaluate(Guid.NewGuid(), CancellationToken.None);
+
+        var notFound = Assert.IsType<NotFoundObjectResult>(result);
+        Assert.Equal(
+            "CONTENT_POST_NOT_FOUND",
+            Assert.IsType<ApiErrorResponse>(notFound.Value).Error.Code);
+    }
+
+    [Fact]
+    public void Update_contract_exposes_no_system_controlled_field()    {
         var properties = typeof(UpdateContentPostRequest)
             .GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Select(property => property.Name)
@@ -245,6 +289,8 @@ public sealed class ContentPostEndpointTests
 
         public InvalidContentPostContentException? ContentFailure { get; init; }
 
+        public ContentEvaluationResponse? Evaluation { get; init; }
+
         public Task<ContentPostResponse?> GenerateFromIdeaAsync(
             Guid contentIdeaId,
             GenerateContentPostRequest request,
@@ -290,5 +336,10 @@ public sealed class ContentPostEndpointTests
             TransitionFailure is not null
                 ? throw TransitionFailure
                 : Task.FromResult(Single);
+
+        public Task<ContentEvaluationResponse?> EvaluateAsync(
+            Guid id,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(Evaluation);
     }
 }

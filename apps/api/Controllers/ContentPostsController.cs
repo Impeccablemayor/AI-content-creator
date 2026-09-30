@@ -186,6 +186,32 @@ public sealed class ContentPostsController : ControllerBase
         }
     }
 
+    [HttpPost("{id:guid}/evaluate")]
+    [ProducesResponseType(typeof(ApiResponse<ContentEvaluationResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status503ServiceUnavailable)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status504GatewayTimeout)]
+    public async Task<IActionResult> Evaluate(
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        var evaluation = await _contentPostService.EvaluateAsync(id, cancellationToken);
+        if (evaluation is null)
+        {
+            return NotFound(CreateError(
+                "CONTENT_POST_NOT_FOUND",
+                "The content post was not found."));
+        }
+
+        return Ok(new ApiResponse<ContentEvaluationResponse>
+        {
+            Data = evaluation,
+            Message = "Content post evaluated successfully."
+        });
+    }
+
     private static ApiErrorResponse CreateError(
         string code,
         string message)

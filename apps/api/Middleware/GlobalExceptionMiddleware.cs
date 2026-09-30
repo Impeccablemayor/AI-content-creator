@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
 using Api.Application.ContentPosts;
 using Api.Contracts.Responses;
@@ -73,6 +74,9 @@ public class GlobalExceptionMiddleware
             ContentIdeaInvalidStatusException =>
                 (HttpStatusCode.Conflict, "CONTENT_IDEA_INVALID_STATUS",
                     "Only approved content ideas can be turned into posts."),
+            ContentEvaluationFailedException evaluationException =>
+                (HttpStatusCode.BadGateway, "CONTENT_EVALUATION_FAILED",
+                    evaluationException.Message),
             InvalidContentIdeaRequestException requestException =>
                 (HttpStatusCode.BadRequest, "INVALID_CONTENT_IDEA_REQUEST",
                     requestException.Message),

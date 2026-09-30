@@ -989,6 +989,7 @@ and rejecting generated posts:
 | `POST` | `/api/v1/content-posts/{id}/regenerate` | Rerun generation on the same post |
 | `POST` | `/api/v1/content-posts/{id}/approve` | Approve a draft |
 | `POST` | `/api/v1/content-posts/{id}/reject` | Reject a draft |
+| `POST` | `/api/v1/content-posts/{id}/evaluate` | Request a quality evaluation |
 
 All routes require authentication and are scoped to the authenticated user's
 workspace. A post belonging to another workspace is treated as not found.
@@ -1072,6 +1073,124 @@ Every response uses the standard API envelope. A post payload includes `id`,
 Scheduling, publishing, variants, and approval history are not part of this
 workflow and are not yet implemented.
 
+#### Quality evaluation
+
+`POST /api/v1/content-posts/{id}/evaluate` takes no request body. It is
+**on-demand and advisory**: the generation path never calls it, and it never
+changes the post's status, content, or timestamps. The user remains responsible
+for approving or rejecting.
+
+Evaluation asks whether a post that already passed hard validation is actually
+worth recommending. Hard validation and quality evaluation are deliberately
+separate: hard validation answers whether the output is structurally and
+technically valid (platform character limits, content type, hashtag format and
+limits, required fields, platform consistency), while quality evaluation answers
+whether the content is specific, grounded, and on-strategy.
+
+The evaluator receives the workspace `BrandProfile`, `AudienceProfile`,
+`ContentStrategy`, the source `ContentIdea`, the post's platform and content, and
+uses a dedicated response schema. The provider layer remains task-agnostic.
+
+Evaluated dimensions:
+
+| Dimension | Question |
+| --- | --- |
+| `strategicFit` | Does it deliver the intended idea and match the content strategy? |
+| `audienceFit` | Does it actually address the target audience? |
+| `hookStrength` | Is the opening strong enough to earn attention? |
+| `value` | Is it useful and specific rather than generic filler? |
+| `clarity` | Is the point clear to a specific reader? |
+| `originality` | Is it specific to this idea rather than reusable filler? |
+| `storytelling` | Does the structure suit the declared content type? |
+| `platformFit` | Does it match the platform's format and length expectations? |
+| `voiceMatch` | Does it match the brand positioning and tone? |
+| `factualReliability` | Does it avoid invented claims, statistics, and experience? |
+
+Response:
+
+```json
+{
+  "data": {
+    "contentPostId": "uuid",
+    "overallScore": 88.00,
+    "recommendation": "MinorEdit",
+    "passed": true,
+    "passThreshold": 70,
+    "dimensions": {
+      "strategicFit": 90,
+      "audienceFit": 86,
+      "hookStrength": 82,
+      "value": 91,
+      "clarity": 94,
+      "originality": 80,
+      "storytelling": 84,
+      "platformFit": 89,
+      "voiceMatch": 93,
+      "factualReliability": 96
+    },
+    "strengths": ["Specific to the audience"],
+    "issues": ["CTA is weak"],
+    "repetition": {
+      "isRepetitive": false,
+      "similarity": 0.12,
+      "similarToContentPostId": null,
+      "threshold": 0.75
+    }
+  },
+  "message": "Content post evaluated successfully."
+}
+```
+
+Scoring is computed by the application, not asserted by the model.
+`overallScore` is the mean of the ten dimensions, rounded to two decimal places.
+`recommendation` is derived from the documented content quality bands:
+
+| Overall score | Recommendation |
+| --- | --- |
+| 90-100 | `Accept` |
+| 80-89 | `MinorEdit` |
+| 70-79 | `ConsiderImprovement` |
+| 60-69 | `Revise` |
+| below 60 | `Rewrite` |
+
+`passed` compares `overallScore` against the configurable `PassThreshold`, which
+defaults to `70` and is returned in the response so the boundary is never
+implicit. Both thresholds are configurable under `ContentQuality`:
+
+```json
+{
+  "ContentQuality": {
+    "PassThreshold": 70,
+    "RepetitionSimilarityThreshold": 0.75
+  }
+}
+```
+
+`passed` is a recommendation, not a gate. It never approves a post, never blocks
+a save, and never changes a status. A post can pass validation and still fail
+evaluation, and the user can approve it anyway.
+
+Repetition is a deterministic token-set Jaccard comparison against the
+workspace's other posts on the same platform, excluding the post itself. It
+requires no embeddings. Semantic similarity via vector search is a later
+capability, not part of this layer.
+
+Evaluation results are **not persisted**. They are returned to the caller for
+the current request only.
+
+| Code | Condition |
+| --- | --- |
+| `404 CONTENT_POST_NOT_FOUND` | Unknown id, or a post in another workspace |
+| `400 CONTENT_CONTEXT_INCOMPLETE` | Workspace brand, audience, or strategy is missing |
+| `502 CONTENT_EVALUATION_FAILED` | The provider returned an unusable evaluation |
+
+`CONTENT_EVALUATION_FAILED` is deliberately distinct from the `AI_RESPONSE_INVALID`
+code used during generation, so an evaluator failure is never mistaken for a
+generation failure. Provider-level errors continue to surface as the existing
+`AI_*` codes.
+
+Deliberately deferred: persisted evaluation history, the `AI-language-risk`
+dimension, `content_feedback`, embedding-based similarity, and any automatic
 quality gate.
 
 ---

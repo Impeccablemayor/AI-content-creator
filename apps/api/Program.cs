@@ -9,6 +9,7 @@ using System.Text;
 using Api.Application.Authentication;
 using Api.Application.AI;
 using Api.Application.AI.Prompts;
+using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
 using Api.Application.Services;
 using Api.Contracts.ContentPost;
@@ -123,15 +124,14 @@ builder.Services
 builder.Services.AddConfiguredAiProvider(builder.Configuration);
 
 builder.Services
-    .AddOptions<AiOptions>()
-    .Bind(builder.Configuration.GetSection(AiOptions.SectionName))
+    .AddOptions<ContentQualityOptions>()
+    .Bind(builder.Configuration.GetSection(ContentQualityOptions.SectionName))
     .Validate(
-        options => !string.IsNullOrWhiteSpace(options.Model) ||
-            string.IsNullOrWhiteSpace(options.ApiKey),
-        "AI configuration is incomplete.")
+        options => options.PassThreshold is >= 0m and <= 100m,
+        "Content quality pass threshold must be between 0 and 100.")
     .Validate(
-        options => options.TimeoutSeconds is >= 1 and <= 120,
-        "AI timeout must be between 1 and 120 seconds.")
+        options => options.RepetitionSimilarityThreshold is >= 0m and <= 1m,
+        "Content quality repetition similarity threshold must be between 0 and 1.")
     .ValidateOnStart();
 
 var jwtOptions = builder.Configuration
@@ -169,6 +169,8 @@ builder.Services.AddScoped<IContentIdeaService, ContentIdeaService>();
 builder.Services.AddScoped<IContentPostService, ContentPostService>();
 builder.Services.AddSingleton<ContentIdeaPromptBuilder>();
 builder.Services.AddSingleton<ContentPostPromptBuilder>();
+builder.Services.AddSingleton<ContentEvaluationPromptBuilder>();
+builder.Services.AddSingleton<ContentRepetitionDetector>();
 
 var app = builder.Build();
 

@@ -2,6 +2,7 @@ using System.Security.Claims;
 using Api.Application.AI;
 using Api.Application.AI.Prompts;
 using Api.Application.Authentication;
+using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
 using Api.Application.ContentPosts;
 using Api.Application.Services;
@@ -187,13 +188,16 @@ public sealed class ContentPostServiceTests
             CreateCurrentUser(workspaceId),
             aiProvider,
             new ContentPostPromptBuilder(),
+            new ContentEvaluationPromptBuilder(),
+            new ContentRepetitionDetector(),
             NullLogger<ContentPostService>.Instance,
             Options.Create(new AiOptions
             {
                 Provider = "Gemini",
                 Model = "test-model",
                 ApiKey = "test-placeholder"
-            }));
+            }),
+            Options.Create(new ContentQualityOptions()));
 
     private static CurrentUserService CreateCurrentUser(Guid workspaceId)
     {

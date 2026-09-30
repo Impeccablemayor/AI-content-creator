@@ -4,6 +4,7 @@ using Api.Application.AI;
 using Api.Application.AI.Models;
 using Api.Application.AI.Prompts;
 using Api.Application.Authentication;
+using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
 using Api.Application.ContentPosts;
 using Api.Contracts.ContentPost;
@@ -28,23 +29,32 @@ public sealed class ContentPostService : IContentPostService
     private readonly CurrentUserService _currentUser;
     private readonly IAiProvider _aiProvider;
     private readonly ContentPostPromptBuilder _promptBuilder;
+    private readonly ContentEvaluationPromptBuilder _evaluationPromptBuilder;
+    private readonly ContentRepetitionDetector _repetitionDetector;
     private readonly ILogger<ContentPostService> _logger;
     private readonly AiOptions _aiOptions;
+    private readonly ContentQualityOptions _contentQualityOptions;
 
     public ContentPostService(
         AppDbContext dbContext,
         CurrentUserService currentUser,
         IAiProvider aiProvider,
         ContentPostPromptBuilder promptBuilder,
+        ContentEvaluationPromptBuilder evaluationPromptBuilder,
+        ContentRepetitionDetector repetitionDetector,
         ILogger<ContentPostService> logger,
-        IOptions<AiOptions> aiOptions)
+        IOptions<AiOptions> aiOptions,
+        IOptions<ContentQualityOptions> contentQualityOptions)
     {
         _dbContext = dbContext;
         _currentUser = currentUser;
         _aiProvider = aiProvider;
         _promptBuilder = promptBuilder;
+        _evaluationPromptBuilder = evaluationPromptBuilder;
+        _repetitionDetector = repetitionDetector;
         _logger = logger;
         _aiOptions = aiOptions.Value;
+        _contentQualityOptions = contentQualityOptions.Value;
     }
 
     public async Task<ContentPostResponse?> GenerateFromIdeaAsync(
@@ -367,6 +377,138 @@ public sealed class ContentPostService : IContentPostService
                 exception.GetType().Name);
             throw;
         }
+    }
+
+    public async Task<ContentEvaluationResponse?> EvaluateAsync(
+        Guid id,
+        CancellationToken cancellationToken = default)
+    {
+        var workspaceId = _currentUser.WorkspaceId;
+        var post = await _dbContext.ContentPosts.AsNoTracking()
+            .SingleOrDefaultAsync(
+                item => item.Id == id && item.WorkspaceId == workspaceId,
+                cancellationToken);
+        if (post is null)
+        {
+            return null;
+        }
+
+        var idea = await _dbContext.ContentIdeas.AsNoTracking()
+            .SingleOrDefaultAsync(
+                item => item.Id == post.ContentIdeaId && item.WorkspaceId == workspaceId,
+                cancellationToken);
+        if (idea is null)
+        {
+            return null;
+        }
+
+        var (brand, audience, strategy) = await LoadGenerationContextAsync(
+            workspaceId,
+            cancellationToken);
+
+        var repetitionCandidates = await _dbContext.ContentPosts.AsNoTracking()
+            .Where(candidate => candidate.WorkspaceId == workspaceId &&
+                candidate.Platform == post.Platform &&
+                candidate.Id != post.Id)
+            .ToListAsync(cancellationToken);
+
+        var repetition = _repetitionDetector.Evaluate(
+            post.Content,
+            repetitionCandidates,
+            _contentQualityOptions.RepetitionSimilarityThreshold);
+
+        var startedAt = Stopwatch.GetTimestamp();
+        _logger.LogInformation(
+            "Content post evaluation started for post {ContentPostId}, idea {ContentIdeaId}, platform {Platform}, provider {Provider}, model {Model}.",
+            post.Id,
+            idea.Id,
+            post.Platform,
+            _aiOptions.Provider,
+            _aiOptions.Model);
+
+        ContentEvaluationResult evaluated;
+        try
+        {
+            var prompt = _evaluationPromptBuilder.Build(
+                brand,
+                audience,
+                strategy,
+                idea,
+                post);
+            var evaluationJson = await _aiProvider.GenerateAsync(
+                ContentEvaluationSystemPrompt.Value,
+                prompt,
+                ContentEvaluationResponseSchema.Value,
+                cancellationToken);
+
+            ContentEvaluationResult? parsed;
+            try
+            {
+                parsed = JsonSerializer.Deserialize<ContentEvaluationResult>(
+                    evaluationJson,
+                    JsonOptions);
+            }
+            catch (JsonException)
+            {
+                throw new ContentEvaluationFailedException(
+                    "The AI evaluation was unusable. The response was not valid structured JSON.");
+            }
+
+            evaluated = ContentEvaluationValidator.ValidateAndNormalize(parsed);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Content post evaluation failed for post {ContentPostId}, provider {Provider}, model {Model} after {DurationMilliseconds} ms with {FailureType}.",
+                post.Id,
+                _aiOptions.Provider,
+                _aiOptions.Model,
+                (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                exception.GetType().Name);
+            throw;
+        }
+
+        _logger.LogInformation(
+            "Content post evaluation succeeded for post {ContentPostId}, provider {Provider}, model {Model} in {DurationMilliseconds} ms.",
+            post.Id,
+            _aiOptions.Provider,
+            _aiOptions.Model,
+            (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
+
+        var overallScore = ContentEvaluationScoring.CalculateOverallScore(evaluated);
+
+        return new ContentEvaluationResponse
+        {
+            ContentPostId = post.Id,
+            OverallScore = overallScore,
+            Recommendation = ContentEvaluationScoring.Recommend(overallScore).ToString(),
+            Passed = ContentEvaluationScoring.Passes(
+                overallScore,
+                _contentQualityOptions.PassThreshold),
+            PassThreshold = _contentQualityOptions.PassThreshold,
+            Dimensions = new ContentEvaluationDimensionsResponse
+            {
+                StrategicFit = evaluated.StrategicFit!.Value,
+                AudienceFit = evaluated.AudienceFit!.Value,
+                HookStrength = evaluated.HookStrength!.Value,
+                Value = evaluated.Value!.Value,
+                Clarity = evaluated.Clarity!.Value,
+                Originality = evaluated.Originality!.Value,
+                Storytelling = evaluated.Storytelling!.Value,
+                PlatformFit = evaluated.PlatformFit!.Value,
+                VoiceMatch = evaluated.VoiceMatch!.Value,
+                FactualReliability = evaluated.FactualReliability!.Value
+            },
+            Strengths = evaluated.Strengths!,
+            Issues = evaluated.Issues!,
+            Repetition = new ContentRepetitionResponse
+            {
+                IsRepetitive = repetition.IsRepetitive,
+                Similarity = repetition.Similarity,
+                SimilarToContentPostId = repetition.SimilarToContentPostId,
+                Threshold = repetition.Threshold
+            }
+        };
     }
 
     private async Task<(BrandProfile Brand, AudienceProfile Audience, ContentStrategy Strategy)>
