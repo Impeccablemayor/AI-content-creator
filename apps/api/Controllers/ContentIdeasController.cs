@@ -1,5 +1,7 @@
 using Api.Application.ContentIdeas;
+using Api.Application.ContentPosts;
 using Api.Contracts.ContentIdea;
+using Api.Contracts.ContentPost;
 using Api.Contracts.Responses;
 using Api.Domain.Enums;
 using Microsoft.AspNetCore.Authorization;
@@ -13,10 +15,14 @@ namespace Api.Controllers;
 public sealed class ContentIdeasController : ControllerBase
 {
     private readonly IContentIdeaService _contentIdeaService;
+    private readonly IContentPostService _contentPostService;
 
-    public ContentIdeasController(IContentIdeaService contentIdeaService)
+    public ContentIdeasController(
+        IContentIdeaService contentIdeaService,
+        IContentPostService contentPostService)
     {
         _contentIdeaService = contentIdeaService;
+        _contentPostService = contentPostService;
     }
 
     [HttpGet]
@@ -51,6 +57,47 @@ public sealed class ContentIdeasController : ControllerBase
             Data = ideas,
             Message = "Content ideas generated successfully."
         });
+    }
+
+    [HttpPost("{id:guid}/generate-post")]
+    [ProducesResponseType(typeof(ApiResponse<ContentPostResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status409Conflict)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status503ServiceUnavailable)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status504GatewayTimeout)]
+    public async Task<IActionResult> GeneratePost(
+        Guid id,
+        [FromBody] GenerateContentPostRequest request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var post = await _contentPostService.GenerateFromIdeaAsync(
+                id,
+                request,
+                cancellationToken);
+
+            if (post is null)
+            {
+                return NotFound(CreateError(
+                    "CONTENT_IDEA_NOT_FOUND",
+                    "The content idea was not found."));
+            }
+
+            return Ok(new ApiResponse<ContentPostResponse>
+            {
+                Data = post,
+                Message = "Content post generated successfully."
+            });
+        }
+        catch (ContentIdeaInvalidStatusException)
+        {
+            return Conflict(CreateError(
+                "CONTENT_IDEA_INVALID_STATUS",
+                "Only approved content ideas can be turned into posts."));
+        }
     }
 
     [HttpPost("{id:guid}/approve")]

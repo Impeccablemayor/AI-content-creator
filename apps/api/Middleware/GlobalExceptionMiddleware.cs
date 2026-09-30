@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using Api.Application.ContentIdeas;
+using Api.Application.ContentPosts;
 using Api.Contracts.Responses;
 
 namespace Api.Middleware;
@@ -51,6 +52,9 @@ public class GlobalExceptionMiddleware
             AiProviderRateLimitedException =>
                 (HttpStatusCode.ServiceUnavailable, "AI_PROVIDER_RATE_LIMITED",
                     "The AI provider is temporarily rate limited. Try again shortly."),
+            AiProviderQuotaExceededException =>
+                (HttpStatusCode.ServiceUnavailable, "AI_PROVIDER_QUOTA_EXCEEDED",
+                    "The configured AI provider quota is exhausted."),
             AiProviderTimeoutException =>
                 (HttpStatusCode.GatewayTimeout, "AI_PROVIDER_TIMEOUT",
                     "The AI provider did not respond in time."),
@@ -63,6 +67,12 @@ public class GlobalExceptionMiddleware
             ContentIdeaContextIncompleteException =>
                 (HttpStatusCode.BadRequest, "CONTENT_CONTEXT_INCOMPLETE",
                     "Complete the workspace brand, audience, and strategy before generating ideas."),
+            InvalidContentPostRequestException requestException =>
+                (HttpStatusCode.BadRequest, "INVALID_CONTENT_POST_REQUEST",
+                    requestException.Message),
+            ContentIdeaInvalidStatusException =>
+                (HttpStatusCode.Conflict, "CONTENT_IDEA_INVALID_STATUS",
+                    "Only approved content ideas can be turned into posts."),
             InvalidContentIdeaRequestException requestException =>
                 (HttpStatusCode.BadRequest, "INVALID_CONTENT_IDEA_REQUEST",
                     requestException.Message),

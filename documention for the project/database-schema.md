@@ -564,6 +564,48 @@ FAILED
 ARCHIVED
 ```
 
+## 11.2 Platform-Specific Content Posts
+
+The current API persists each generated platform post as a draft linked to its
+source idea and workspace. This first implementation supports LinkedIn and X;
+scheduling and publishing remain later lifecycle steps.
+
+### Table
+
+```text
+content_posts
+```
+
+### Fields
+
+| Field | Type | Description |
+|---|---|---|
+| Id | UUID | Primary key |
+| WorkspaceId | UUID | Owning workspace |
+| ContentIdeaId | UUID | Approved source idea |
+| Platform | VARCHAR(50) | LinkedIn or X |
+| Status | VARCHAR(50) | Draft, Approved, Scheduled, Published, or Rejected |
+| Content | VARCHAR(3000) | Complete platform-specific post text |
+| Hook | VARCHAR(300) | Opening hook |
+| CallToAction | VARCHAR(300) | Optional CTA |
+| Hashtags | TEXT[] | Normalized, relevant hashtags |
+| ContentType | VARCHAR(50) | Educational, Story, Opinion, HowTo, CaseStudy, Insight, or Question |
+| StorytellingStructure | VARCHAR(300) | Concise applied structure |
+| CreatedAt | TIMESTAMPTZ | Creation time |
+| UpdatedAt | TIMESTAMPTZ | Last update |
+
+### Constraints
+
+```text
+UNIQUE (ContentIdeaId, Platform)
+FOREIGN KEY (WorkspaceId, ContentIdeaId) REFERENCES content_ideas (WorkspaceId, Id)
+INDEX (WorkspaceId, Status, CreatedAt)
+```
+
+Generating an existing draft for the same idea and platform returns it without
+another AI request. The composite foreign key ensures the post and source idea
+belong to the same workspace.
+
 ---
 
 # 12. Platform Content Variants

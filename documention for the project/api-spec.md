@@ -945,6 +945,135 @@ Generates a draft from an existing content idea.
 
 The API should not expose hidden chain-of-thought or private model reasoning. Any returned explanation must be a concise, user-safe rationale.
 
+### Current Content-Idea Post Generation Endpoint
+
+The current API exposes post generation from an approved, workspace-owned
+content idea:
+
+```http
+POST /api/v1/content-ideas/{id}/generate-post
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "platform": "LinkedIn"
+}
+```
+
+Only `LinkedIn` and `X` are supported. A draft is unique per content idea and
+platform. If one already exists, the API returns it without another provider
+request. Suggested or rejected ideas cannot generate posts; only approved ideas
+can. Idea lookup, context loading, duplicate checks, and persistence are scoped
+to the authenticated user's workspace.
+
+Successful responses use the standard API envelope and include the generated
+content, hook, CTA, hashtags, content type, storytelling structure, status, and
+creation time. Invalid idea status returns `409 CONTENT_IDEA_INVALID_STATUS`;
+an idea outside the current workspace returns `404 CONTENT_IDEA_NOT_FOUND`.
+
+### Current Content Post Review and Editing Endpoints
+
+The current API exposes a dedicated content post resource under
+`/api/v1/content-posts` for listing, reading, editing, regenerating, approving,
+and rejecting generated posts:
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/content-posts` | List workspace posts, optionally filtered |
+| `GET` | `/api/v1/content-posts/{id}` | Read one workspace post |
+| `PATCH` | `/api/v1/content-posts/{id}` | Edit a draft's content |
+| `POST` | `/api/v1/content-posts/{id}/regenerate` | Rerun generation on the same post |
+| `POST` | `/api/v1/content-posts/{id}/approve` | Approve a draft |
+| `POST` | `/api/v1/content-posts/{id}/reject` | Reject a draft |
+
+All routes require authentication and are scoped to the authenticated user's
+workspace. A post belonging to another workspace is treated as not found.
+
+`GET /api/v1/content-posts` accepts optional `status` and `platform` query
+parameters and returns posts newest first.
+
+#### Review lifecycle
+
+The persisted lifecycle is `Draft`, `Approved`, `Scheduled`, `Published`, and
+`Rejected`. The implemented review workflow is deliberately narrow and is
+enforced server-side; the client cannot set `status` directly.
+
+| Current status | Edit | Regenerate | Approve | Reject |
+| --- | --- | --- | --- | --- |
+| `Draft` | yes | yes | yes | yes |
+| `Rejected` | no | yes, returns to `Draft` | no | no |
+| `Approved` | no | no | no | no |
+| `Scheduled` | no | no | no | no |
+| `Published` | no | no | no | no |
+
+Rationale:
+
+- Only drafts are reviewable, so an approved post is never silently changed.
+  Approved content cannot return to `Draft`.
+- Scheduled and published posts are protected from every review mutation.
+- Regenerating a rejected post is the explicit revision step: it reuses the same
+  post identity, keeps the same content idea and platform, and moves the post
+  back to `Draft` for another review pass. It never moves a post to `Published`.
+- Any disallowed mutation returns `409 INVALID_CONTENT_POST_TRANSITION`.
+
+#### Editable fields
+
+`PATCH /api/v1/content-posts/{id}` replaces the full editable content set:
+
+```json
+{
+  "content": "A hand written post",
+  "hook": "A hand written hook",
+  "callToAction": "What would you add?",
+  "hashtags": ["AI", "SoftwareEngineering"],
+  "contentType": "Insight",
+  "storytellingStructure": "Hook → Insight → Takeaway → CTA"
+}
+```
+
+Ids, workspace, content idea relation, platform, status, `createdAt`, and
+`updatedAt` are system-controlled and are never accepted from the client.
+Validation is shared with generation, so an edit is held to the same rules:
+platform content limits measured in Unicode code points (280 for `X`, 3000
+otherwise), hashtag limits (3 for `X`, 5 otherwise), hashtag trimming,
+normalization, de-duplication, and generic-tag removal, required and length-
+bounded hook, CTA, and storytelling structure, and a valid content type. An edit
+that fails validation returns `400 INVALID_CONTENT_POST_CONTENT` and leaves the
+stored post unchanged.
+
+#### Regeneration
+
+`POST /api/v1/content-posts/{id}/regenerate` takes no request body. It reuses
+the existing content idea, platform, and post id, re-runs generation with the
+configured provider and the content post response schema, and sets `updatedAt`.
+It does not create a second post for the same idea and platform. Generation
+requires the workspace brand profile, audience profile, and content strategy, so
+an incomplete workspace returns `400 CONTENT_CONTEXT_INCOMPLETE`. Provider
+failures surface as the existing `AI_*` and `AI_RESPONSE_INVALID` errors.
+
+#### Responses
+
+Every response uses the standard API envelope. A post payload includes `id`,
+`contentIdeaId`, `platform`, `status`, `content`, `hook`, `callToAction`,
+`hashtags`, `contentType`, `storytellingStructure`, `createdAt`, and
+`updatedAt`. Successful edits, regenerations, approvals, and rejections advance
+`updatedAt`; `createdAt` is never changed.
+
+| Code | Condition |
+| --- | --- |
+| `404 CONTENT_POST_NOT_FOUND` | Unknown id, or a post in another workspace |
+| `409 INVALID_CONTENT_POST_TRANSITION` | The current status forbids the operation |
+| `400 INVALID_CONTENT_POST_CONTENT` | Edited content failed shared validation |
+
+Scheduling, publishing, variants, and approval history are not part of this
+workflow and are not yet implemented.
+
+quality gate.
+
 ---
 
 # 27. Content Evaluation

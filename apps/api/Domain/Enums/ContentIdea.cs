@@ -39,5 +39,8 @@ public sealed class ContentIdea
 
     public DateTime UpdatedAt { get; set; }
 
+    public ICollection<ContentPost> ContentPosts { get; set; }
+        = new List<ContentPost>();
+
     public Workspace Workspace { get; set; } = null!;
 }

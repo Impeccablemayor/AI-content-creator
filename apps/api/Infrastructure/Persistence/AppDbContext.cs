@@ -17,6 +17,7 @@ public sealed class AppDbContext : DbContext
     public DbSet<AudienceProfile> AudienceProfiles => Set<AudienceProfile>();
     public DbSet<ContentStrategy> ContentStrategies => Set<ContentStrategy>();
     public DbSet<ContentIdea> ContentIdeas => Set<ContentIdea>();
+    public DbSet<ContentPost> ContentPosts => Set<ContentPost>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -27,6 +28,8 @@ public sealed class AppDbContext : DbContext
         modelBuilder.Entity<ContentIdea>(entity =>
         {
             entity.HasKey(x => x.Id);
+
+            entity.HasAlternateKey(x => new { x.WorkspaceId, x.Id });
 
             entity.HasIndex(x => new
             {
@@ -85,6 +88,57 @@ public sealed class AppDbContext : DbContext
             entity.HasOne(x => x.Workspace)
                 .WithMany(x => x.ContentIdeas)
                 .HasForeignKey(x => x.WorkspaceId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ContentPost>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+
+            entity.HasIndex(x => new { x.ContentIdeaId, x.Platform })
+                .IsUnique();
+
+            entity.HasIndex(x => new { x.WorkspaceId, x.Status, x.CreatedAt });
+
+            entity.Property(x => x.Platform)
+                .HasConversion<string>()
+                .HasMaxLength(50)
+                .IsRequired();
+
+            entity.Property(x => x.Status)
+                .HasConversion<string>()
+                .HasMaxLength(50)
+                .IsRequired();
+
+            entity.Property(x => x.Content)
+                .HasMaxLength(3000)
+                .IsRequired();
+
+            entity.Property(x => x.Hook)
+                .HasMaxLength(300)
+                .IsRequired();
+
+            entity.Property(x => x.CallToAction)
+                .HasMaxLength(300)
+                .IsRequired();
+
+            entity.Property(x => x.Hashtags)
+                .HasColumnType("text[]")
+                .IsRequired();
+
+            entity.Property(x => x.ContentType)
+                .HasConversion<string>()
+                .HasMaxLength(50)
+                .IsRequired();
+
+            entity.Property(x => x.StorytellingStructure)
+                .HasMaxLength(300)
+                .IsRequired();
+
+            entity.HasOne(x => x.ContentIdea)
+                .WithMany(x => x.ContentPosts)
+                .HasForeignKey(x => new { x.WorkspaceId, x.ContentIdeaId })
+                .HasPrincipalKey(x => new { x.WorkspaceId, x.Id })
                 .OnDelete(DeleteBehavior.Cascade);
         });
 

@@ -1,4 +1,5 @@
 using Api.Configuration;
+using Api.Configuration.Swagger;
 using Api.Infrastructure.Persistence;
 using Api.Middleware;
 using Microsoft.EntityFrameworkCore;
@@ -9,8 +10,11 @@ using Api.Application.Authentication;
 using Api.Application.AI;
 using Api.Application.AI.Prompts;
 using Api.Application.ContentIdeas;
+using Api.Application.Services;
+using Api.Contracts.ContentPost;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.OpenApi;
 using Microsoft.IdentityModel.Tokens;
 
 var environmentName = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT")
@@ -88,7 +92,19 @@ builder.Services
         };
     });
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = ParameterLocation.Header,
+        Description = "JWT bearer access token."
+    });
+    options.OperationFilter<AuthorizeOperationFilter>();
+});
 builder.Services
     .AddHealthChecks()
     .AddCheck<RedisHealthCheck>("redis");
@@ -104,15 +120,15 @@ builder.Services
         "JWT secret key must be at least 32 characters.")
     .ValidateOnStart();
 
+builder.Services.AddConfiguredAiProvider(builder.Configuration);
+
 builder.Services
     .AddOptions<AiOptions>()
     .Bind(builder.Configuration.GetSection(AiOptions.SectionName))
     .Validate(
-        options => options.Provider.Equals("Unavailable", StringComparison.OrdinalIgnoreCase) ||
-            (options.Provider.Equals("OpenAI", StringComparison.OrdinalIgnoreCase) &&
-                !string.IsNullOrWhiteSpace(options.Model) &&
-                !string.IsNullOrWhiteSpace(options.ApiKey)),
-        "AI provider must be Unavailable or OpenAI; OpenAI requires a model and API key.")
+        options => !string.IsNullOrWhiteSpace(options.Model) ||
+            string.IsNullOrWhiteSpace(options.ApiKey),
+        "AI configuration is incomplete.")
     .Validate(
         options => options.TimeoutSeconds is >= 1 and <= 120,
         "AI timeout must be between 1 and 120 seconds.")
@@ -150,41 +166,31 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<CurrentUserService>();
 builder.Services.AddScoped<JwtTokenService>();
 builder.Services.AddScoped<IContentIdeaService, ContentIdeaService>();
-var aiProvider = builder.Configuration[$"{AiOptions.SectionName}:Provider"]
-    ?? "Unavailable";
-if (aiProvider.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
-{
-    builder.Services.AddHttpClient<IAiProvider, OpenAiProvider>(
-        (serviceProvider, client) =>
-        {
-            var options = serviceProvider
-                .GetRequiredService<Microsoft.Extensions.Options.IOptions<AiOptions>>()
-                .Value;
-            client.BaseAddress = new Uri("https://api.openai.com/v1/");
-            client.Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds);
-        });
-}
-else if (aiProvider.Equals("Unavailable", StringComparison.OrdinalIgnoreCase))
-{
-    builder.Services.AddSingleton<IAiProvider, UnavailableAiProvider>();
-}
-else
-{
-    throw new InvalidOperationException(
-        "AI:Provider must be set to Unavailable or OpenAI.");
-}
+builder.Services.AddScoped<IContentPostService, ContentPostService>();
 builder.Services.AddSingleton<ContentIdeaPromptBuilder>();
+builder.Services.AddSingleton<ContentPostPromptBuilder>();
 
 var app = builder.Build();
 
 var aiOptions = app.Services
     .GetRequiredService<Microsoft.Extensions.Options.IOptions<AiOptions>>()
     .Value;
+var aiProvider = app.Services.GetRequiredService<IAiProvider>();
 app.Logger.LogInformation(
-    "AI provider configured: {Provider}; model: {Model}; API key configured: {ApiKeyConfigured}",
+    "AI provider configured: {Provider}; implementation: {ProviderImplementation}; " +
+    "model: {Model}; API key configured: {ApiKeyConfigured}",
     aiOptions.Provider,
+    aiProvider.GetType().Name,
     aiOptions.Model,
     !string.IsNullOrWhiteSpace(aiOptions.ApiKey));
+if (aiOptions.Provider.Equals("Unavailable", StringComparison.OrdinalIgnoreCase) &&
+    !string.IsNullOrWhiteSpace(aiOptions.Model) &&
+    !string.IsNullOrWhiteSpace(aiOptions.ApiKey))
+{
+    app.Logger.LogWarning(
+        "AI__Provider is effectively Unavailable although a model and API key are configured. " +
+        "Check AI__Provider in the Development .env file; its value overrides inherited process environment variables.");
+}
 
 // Global exception handling
 app.UseMiddleware<GlobalExceptionMiddleware>();
