@@ -1,5 +1,6 @@
 using Api.Configuration;
 using Api.Configuration.Swagger;
+using Api.Infrastructure.Health;
 using Api.Infrastructure.Persistence;
 using Api.Middleware;
 using Microsoft.EntityFrameworkCore;
@@ -21,6 +22,7 @@ using Api.Application.Services;
 using Api.Application.SocialAccounts;
 using Api.Contracts.ContentPost;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.OpenApi;
 using Microsoft.IdentityModel.Tokens;
@@ -67,9 +69,27 @@ var configuredRedisOptions = builder.Configuration
     .GetSection(RedisOptions.SectionName)
     .Get<RedisOptions>()
     ?? new RedisOptions();
+
+// AbortOnConnectFail is off unless the connection string says otherwise. Left at
+// the library default of true, Connect throws the first time it is resolved while
+// Redis is down, which escapes the health check as a 500 instead of the 503 the
+// probe needs, and turns a cache outage into an error page. With it off the
+// multiplexer keeps retrying in the background and RedisHealthCheck reports the
+// outage through its own result, which is what lets the rest of the API keep
+// serving the requests that do not need the cache.
+var redisConfiguration = ConfigurationOptions.Parse(
+    configuredRedisOptions.ConnectionString);
+
+if (!configuredRedisOptions.ConnectionString.Contains(
+        "abortConnect",
+        StringComparison.OrdinalIgnoreCase))
+{
+    redisConfiguration.AbortOnConnectFail = false;
+}
+
 var redisMultiplexer = new Lazy<Task<IConnectionMultiplexer>>(
     () => Task.FromResult<IConnectionMultiplexer>(
-        ConnectionMultiplexer.Connect(configuredRedisOptions.ConnectionString)));
+        ConnectionMultiplexer.Connect(redisConfiguration)));
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
     redisMultiplexer.Value.GetAwaiter().GetResult());
@@ -119,9 +139,20 @@ builder.Services.AddSwaggerGen(options =>
     });
     options.OperationFilter<AuthorizeOperationFilter>();
 });
+// The readiness checks run against the dependencies the API cannot serve traffic
+// without. AI provider configuration is included but cannot fail the endpoint: see
+// AiProviderReadinessCheck for why it must not make a network call.
 builder.Services
     .AddHealthChecks()
-    .AddCheck<RedisHealthCheck>("redis");
+    .AddCheck<PostgresHealthCheck>(
+        "postgres",
+        tags: ["ready", "database"])
+    .AddCheck<RedisHealthCheck>(
+        "redis",
+        tags: ["ready", "cache"])
+    .AddCheck<AiProviderReadinessCheck>(
+        "ai-provider",
+        tags: ["ready"]);
 
 builder.Services
     .AddOptions<JwtOptions>()
@@ -240,6 +271,10 @@ if (aiOptions.Provider.Equals("Unavailable", StringComparison.OrdinalIgnoreCase)
         "Check AI__Provider in the Development .env file; its value overrides inherited process environment variables.");
 }
 
+// Correlation runs first so every later stage, including the exception handler,
+// logs and reports under one identifier.
+app.UseMiddleware<CorrelationIdMiddleware>();
+
 // Global exception handling
 app.UseMiddleware<GlobalExceptionMiddleware>();
 
@@ -256,6 +291,34 @@ app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 
+// Liveness answers only whether this process can serve a request. It runs no
+// dependency check on purpose: if it did, a database outage would have an
+// orchestrator restarting a process that is otherwise perfectly able to answer,
+// which turns a recoverable dependency failure into an outage.
+app.MapHealthChecks("/api/v1/health/live", new HealthCheckOptions
+{
+    Predicate = _ => false,
+    ResponseWriter = HealthResponseWriter.WriteAsync
+});
+
+// Readiness runs the dependency checks. A dependency that is down answers 503, so
+// the response describes the system instead of asserting it is fine.
+app.MapHealthChecks("/api/v1/health", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready"),
+    ResponseWriter = HealthResponseWriter.WriteAsync
+});
+
 app.MapControllers();
 
 app.Run();
+
+/// <summary>
+/// Named so the integration test project can host this exact composition root through
+/// <c>WebApplicationFactory&lt;Program&gt;</c>. Without it, a top-level program is
+/// internal and the tests would have to rebuild the container, which is the part
+/// under test.
+/// </summary>
+public partial class Program
+{
+}

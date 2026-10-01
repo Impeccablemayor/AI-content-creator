@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore MayorxContentEngine.slnx
+
+      # Warnings are errors here so a new one cannot reach main unnoticed. The
+      # local build is warning-tolerant, which is the wrong trade for CI.
+      - name: Build
+        run: dotnet build MayorxContentEngine.slnx --no-restore -warnaserror
+
+      - name: Unit tests
+        run: dotnet test tests/unit/api.tests.csproj --no-build
+
+      # The same compose file a developer runs. The integration tests create their
+      # own database inside this PostgreSQL and drop it afterwards, so the instance
+      # itself is left as it was found.
+      - name: Start PostgreSQL and Redis
+        run: docker compose up -d --wait
+
+      - name: Integration tests
+        env:
+          MAYORX_TEST_POSTGRES: >-
+            Host=localhost;Port=5432;Database=postgres;Username=mayorx;Password=mayorx_dev_password
+          MAYORX_TEST_REDIS: localhost:6379
+        run: dotnet test tests/integration/Integration.Tests.csproj --no-build
+
+      - name: Integration logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop PostgreSQL and Redis
+        if: always()
+        run: docker compose down -v

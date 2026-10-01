@@ -4,6 +4,7 @@
     <Project Path="apps/worker/worker.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/integration/Integration.Tests.csproj" />
     <Project Path="tests/unit/api.tests.csproj" />
   </Folder>
 </Solution>
