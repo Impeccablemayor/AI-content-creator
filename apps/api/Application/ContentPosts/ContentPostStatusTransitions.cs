@@ -15,4 +15,15 @@ public static class ContentPostStatusTransitions
 
     public static bool CanReject(ContentPostStatus status) =>
         status == ContentPostStatus.Draft;
+
+    public static bool CanSchedule(ContentPostStatus status) =>
+        status is ContentPostStatus.Approved or ContentPostStatus.Scheduled;
+
+    /// <summary>
+    /// Only a scheduled post may be published. Publishing is driven by the
+    /// worker, so this is the single gate that keeps a draft, approved,
+    /// rejected, or already published post from being sent to a platform.
+    /// </summary>
+    public static bool CanPublish(ContentPostStatus status) =>
+        status == ContentPostStatus.Scheduled;
 }

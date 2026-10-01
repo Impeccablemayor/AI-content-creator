@@ -38,4 +38,9 @@ public interface IContentPostService
     Task<ContentEvaluationResponse?> EvaluateAsync(
         Guid id,
         CancellationToken cancellationToken = default);
+
+    Task<ContentPostResponse?> ScheduleAsync(
+        Guid id,
+        ScheduleContentPostRequest request,
+        CancellationToken cancellationToken = default);
 }

@@ -15,3 +15,10 @@ public sealed class InvalidContentPostContentException : Exception
     {
     }
 }
+
+public sealed class InvalidContentPostScheduleTimeException : Exception
+{
+    public InvalidContentPostScheduleTimeException(string message) : base(message)
+    {
+    }
+}

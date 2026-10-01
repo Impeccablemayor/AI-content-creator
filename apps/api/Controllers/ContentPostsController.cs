@@ -186,6 +186,34 @@ public sealed class ContentPostsController : ControllerBase
         }
     }
 
+    [HttpPost("{id:guid}/schedule")]
+    [ProducesResponseType(typeof(ApiResponse<ContentPostResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> Schedule(
+        Guid id,
+        [FromBody] ScheduleContentPostRequest request,
+        CancellationToken cancellationToken)
+    {
+        var post = await _contentPostService.ScheduleAsync(
+            id,
+            request,
+            cancellationToken);
+        if (post is null)
+        {
+            return NotFound(CreateError(
+                "CONTENT_POST_NOT_FOUND",
+                "The content post was not found."));
+        }
+
+        return Ok(new ApiResponse<ContentPostResponse>
+        {
+            Data = post,
+            Message = "Content post scheduled successfully."
+        });
+    }
+
     [HttpPost("{id:guid}/evaluate")]
     [ProducesResponseType(typeof(ApiResponse<ContentEvaluationResponse>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status400BadRequest)]

@@ -68,6 +68,7 @@ public sealed class ContentPostEndpointTests
     [InlineData(nameof(ContentPostsController.Approve), "{id:guid}/approve")]
     [InlineData(nameof(ContentPostsController.Reject), "{id:guid}/reject")]
     [InlineData(nameof(ContentPostsController.Evaluate), "{id:guid}/evaluate")]
+    [InlineData(nameof(ContentPostsController.Schedule), "{id:guid}/schedule")]
     public void Post_actions_use_post_verbs_on_guarded_id_templates(string actionName, string expectedTemplate)
     {
         var action = GetActions()
@@ -177,6 +178,66 @@ public sealed class ContentPostEndpointTests
         var envelope = Assert.IsType<ApiResponse<ContentPostResponse>>(ok.Value);
         Assert.Equal("Content post updated successfully.", envelope.Message);
         Assert.Same(post, envelope.Data);
+    }
+
+    [Fact]
+    public async Task Schedule_returns_the_success_envelope_with_the_new_time()
+    {
+        var scheduledAt = DateTime.UtcNow.AddHours(2);
+        var post = new ContentPostResponse
+        {
+            Id = Guid.NewGuid(),
+            Status = "Scheduled",
+            ScheduledAt = scheduledAt
+        };
+        var controller = new ContentPostsController(new StubContentPostService
+        {
+            Scheduled = post
+        });
+
+        var result = await controller.Schedule(
+            post.Id,
+            new ScheduleContentPostRequest { ScheduledAt = scheduledAt },
+            CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var envelope = Assert.IsType<ApiResponse<ContentPostResponse>>(ok.Value);
+        Assert.Equal("Content post scheduled successfully.", envelope.Message);
+        Assert.Equal("Scheduled", envelope.Data.Status);
+        Assert.Equal(scheduledAt, envelope.Data.ScheduledAt);
+    }
+
+    [Fact]
+    public async Task Schedule_returns_404_for_an_unknown_or_foreign_post()
+    {
+        var controller = new ContentPostsController(new StubContentPostService
+        {
+            Scheduled = null
+        });
+
+        var result = await controller.Schedule(
+            Guid.NewGuid(),
+            new ScheduleContentPostRequest { ScheduledAt = DateTimeOffset.UtcNow.AddHours(1) },
+            CancellationToken.None);
+
+        var notFound = Assert.IsType<NotFoundObjectResult>(result);
+        Assert.Equal(
+            "CONTENT_POST_NOT_FOUND",
+            Assert.IsType<ApiErrorResponse>(notFound.Value).Error.Code);
+    }
+
+    [Fact]
+    public void Update_contract_still_exposes_no_status_or_schedule_field()
+    {
+        var properties = typeof(UpdateContentPostRequest)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Select(property => property.Name)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.DoesNotContain("Status", properties);
+        Assert.DoesNotContain("ScheduledAt", properties);
+        Assert.DoesNotContain("PublishClaimedAt", properties);
     }
 
     [Fact]
@@ -290,6 +351,18 @@ public sealed class ContentPostEndpointTests
         public InvalidContentPostContentException? ContentFailure { get; init; }
 
         public ContentEvaluationResponse? Evaluation { get; init; }
+
+        public ContentPostResponse? Scheduled { get; init; }
+
+        public InvalidContentPostScheduleTimeException? ScheduleTimeFailure { get; init; }
+
+        public Task<ContentPostResponse?> ScheduleAsync(
+            Guid id,
+            ScheduleContentPostRequest request,
+            CancellationToken cancellationToken = default) =>
+            ScheduleTimeFailure is not null
+                ? throw ScheduleTimeFailure
+                : Task.FromResult(Scheduled);
 
         public Task<ContentPostResponse?> GenerateFromIdeaAsync(
             Guid contentIdeaId,

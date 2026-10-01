@@ -43,4 +43,17 @@ public sealed class ContentPostStatusTransitionsTests
     [InlineData(ContentPostStatus.Rejected, false)]
     public void Only_drafts_can_be_rejected(ContentPostStatus status, bool expected) =>
         Assert.Equal(expected, ContentPostStatusTransitions.CanReject(status));
+
+    /// <summary>
+    /// Only a scheduled post is publishable, and publishing is terminal: a
+    /// published post is never published again.
+    /// </summary>
+    [Theory]
+    [InlineData(ContentPostStatus.Draft, false)]
+    [InlineData(ContentPostStatus.Approved, false)]
+    [InlineData(ContentPostStatus.Scheduled, true)]
+    [InlineData(ContentPostStatus.Published, false)]
+    [InlineData(ContentPostStatus.Rejected, false)]
+    public void Only_scheduled_posts_can_be_published(ContentPostStatus status, bool expected) =>
+        Assert.Equal(expected, ContentPostStatusTransitions.CanPublish(status));
 }

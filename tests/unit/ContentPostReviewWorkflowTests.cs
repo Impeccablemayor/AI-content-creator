@@ -445,7 +445,9 @@ public sealed class ContentPostReviewWorkflowTests
         new(
             dbContext,
             CreateCurrentUser(workspaceId),
+            AuditLogTestContext.Create(dbContext, workspaceId),
             aiProvider,
+            AiRunTestContext.Create(dbContext, workspaceId),
             new ContentPostPromptBuilder(),
             new ContentEvaluationPromptBuilder(),
             new ContentRepetitionDetector(),
@@ -472,6 +474,48 @@ public sealed class ContentPostReviewWorkflowTests
             }
         };
         return new CurrentUserService(accessor);
+    }
+
+    [Fact]
+    public async Task A_published_post_reports_when_it_was_published()
+    {
+        var workspaceId = Guid.NewGuid();
+        await using var dbContext = CreateDbContext();
+        var idea = AddIdea(dbContext, workspaceId);
+        var post = SeedOlder(dbContext, idea.Id, workspaceId, ContentPostStatus.Published, "Shipped", OldTimestamp);
+        var publishedAt = OldTimestamp.AddHours(2);
+        post.PublishedAt = publishedAt;
+        await dbContext.SaveChangesAsync();
+        var service = CreateService(dbContext, workspaceId, new StubAiProvider(CreateValidResponse("LinkedIn")));
+
+        var found = await service.GetAsync(post.Id);
+
+        Assert.NotNull(found);
+        Assert.Equal(publishedAt, found!.PublishedAt);
+        Assert.Null(found.PublishFailureReason);
+    }
+
+    /// <summary>
+    /// A failed publish leaves the post Scheduled, so the recorded reason is the
+    /// only signal that explains a post that is overdue but not published.
+    /// </summary>
+    [Fact]
+    public async Task An_overdue_post_reports_why_its_last_publish_failed()
+    {
+        var workspaceId = Guid.NewGuid();
+        await using var dbContext = CreateDbContext();
+        var idea = AddIdea(dbContext, workspaceId);
+        var post = SeedOlder(dbContext, idea.Id, workspaceId, ContentPostStatus.Scheduled, "Unpublished", OldTimestamp);
+        post.PublishFailureReason = PublishFailureReason.SocialAccountNotFound;
+        await dbContext.SaveChangesAsync();
+        var service = CreateService(dbContext, workspaceId, new StubAiProvider(CreateValidResponse("LinkedIn")));
+
+        var found = await service.GetAsync(post.Id);
+
+        Assert.NotNull(found);
+        Assert.Equal("Scheduled", found!.Status);
+        Assert.Null(found.PublishedAt);
+        Assert.Equal("SocialAccountNotFound", found.PublishFailureReason);
     }
 
     private static ContentIdea AddIdea(AppDbContext dbContext, Guid workspaceId)

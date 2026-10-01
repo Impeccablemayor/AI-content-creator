@@ -6,6 +6,7 @@ using Api.Application.AI.Prompts;
 using Api.Application.Authentication;
 using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
+using Api.Application.AuditLogs;
 using Api.Application.ContentPosts;
 using Api.Contracts.ContentPost;
 using Api.Configuration;
@@ -27,7 +28,9 @@ public sealed class ContentPostService : IContentPostService
 
     private readonly AppDbContext _dbContext;
     private readonly CurrentUserService _currentUser;
+    private readonly IAuditLogService _auditLog;
     private readonly IAiProvider _aiProvider;
+    private readonly IAiRunRecorder _aiRunRecorder;
     private readonly ContentPostPromptBuilder _promptBuilder;
     private readonly ContentEvaluationPromptBuilder _evaluationPromptBuilder;
     private readonly ContentRepetitionDetector _repetitionDetector;
@@ -38,7 +41,9 @@ public sealed class ContentPostService : IContentPostService
     public ContentPostService(
         AppDbContext dbContext,
         CurrentUserService currentUser,
+        IAuditLogService auditLog,
         IAiProvider aiProvider,
+        IAiRunRecorder aiRunRecorder,
         ContentPostPromptBuilder promptBuilder,
         ContentEvaluationPromptBuilder evaluationPromptBuilder,
         ContentRepetitionDetector repetitionDetector,
@@ -48,7 +53,9 @@ public sealed class ContentPostService : IContentPostService
     {
         _dbContext = dbContext;
         _currentUser = currentUser;
+        _auditLog = auditLog;
         _aiProvider = aiProvider;
+        _aiRunRecorder = aiRunRecorder;
         _promptBuilder = promptBuilder;
         _evaluationPromptBuilder = evaluationPromptBuilder;
         _repetitionDetector = repetitionDetector;
@@ -252,6 +259,7 @@ public sealed class ContentPostService : IContentPostService
             id,
             ContentPostStatusTransitions.CanApprove,
             ContentPostStatus.Approved,
+            AuditAction.ContentApproved,
             "Only draft content posts can be approved.",
             cancellationToken);
 
@@ -262,13 +270,65 @@ public sealed class ContentPostService : IContentPostService
             id,
             ContentPostStatusTransitions.CanReject,
             ContentPostStatus.Rejected,
+            AuditAction.ContentRejected,
             "Only draft content posts can be rejected.",
             cancellationToken);
+
+    public async Task<ContentPostResponse?> ScheduleAsync(
+        Guid id,
+        ScheduleContentPostRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var post = await FindTrackedPostAsync(id, cancellationToken);
+        if (post is null)
+        {
+            return null;
+        }
+
+        if (!ContentPostStatusTransitions.CanSchedule(post.Status))
+        {
+            throw new InvalidContentPostTransitionException(
+                "Only approved content posts can be scheduled, and a scheduled post " +
+                $"can only be rescheduled. This post is {post.Status}.");
+        }
+
+        var scheduledAt = request.ScheduledAt.UtcDateTime;
+        if (scheduledAt <= DateTime.UtcNow)
+        {
+            throw new InvalidContentPostScheduleTimeException(
+                "ScheduledAt must be in the future.");
+        }
+
+        post.Status = ContentPostStatus.Scheduled;
+        post.ScheduledAt = scheduledAt;
+        post.PublishClaimedAt = null;
+        post.UpdatedAt = DateTime.UtcNow;
+
+        // Queued, not saved: written by the same SaveChanges as the schedule.
+        await _auditLog.RecordAsync(
+            AuditAction.ScheduleCreated,
+            "ContentPost",
+            post.Id,
+            null,
+            new
+            {
+                status = ContentPostStatus.Scheduled.ToString(),
+                scheduledAt
+            },
+            cancellationToken);
+
+        await _dbContext.SaveChangesAsync(cancellationToken);
+
+        return Map(post);
+    }
 
     private async Task<ContentPostResponse?> TransitionAsync(
         Guid id,
         Func<ContentPostStatus, bool> isAllowed,
         ContentPostStatus target,
+        AuditAction auditAction,
         string rejectionMessage,
         CancellationToken cancellationToken)
     {
@@ -284,8 +344,21 @@ public sealed class ContentPostService : IContentPostService
                 $"{rejectionMessage} This post is {post.Status}.");
         }
 
+        var previous = post.Status;
+
         post.Status = target;
         post.UpdatedAt = DateTime.UtcNow;
+
+        // Queued, not saved: the row is written by the single SaveChanges below
+        // so the audit entry and the status change share one transaction.
+        await _auditLog.RecordAsync(
+            auditAction,
+            "ContentPost",
+            post.Id,
+            new { status = previous.ToString() },
+            new { status = target.ToString() },
+            cancellationToken);
+
         await _dbContext.SaveChangesAsync(cancellationToken);
 
         return Map(post);
@@ -353,6 +426,18 @@ public sealed class ContentPostService : IContentPostService
                 generated,
                 platform);
 
+            await _aiRunRecorder.RecordSuccessAsync(
+                AIRunType.ContentGeneration,
+                ContentPostSystemPrompt.Version,
+                Stopwatch.GetElapsedTime(startedAt),
+                new
+                {
+                    contentIdeaId = idea.Id,
+                    platform = platform.ToString(),
+                    operation
+                },
+                cancellationToken);
+
             _logger.LogInformation(
                 "Content post {Operation} succeeded for idea {ContentIdeaId}, platform {Platform}, provider {Provider}, model {Model} in {DurationMilliseconds} ms.",
                 operation,
@@ -366,6 +451,19 @@ public sealed class ContentPostService : IContentPostService
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            await _aiRunRecorder.RecordFailureAsync(
+                AIRunType.ContentGeneration,
+                ContentPostSystemPrompt.Version,
+                Stopwatch.GetElapsedTime(startedAt),
+                exception,
+                new
+                {
+                    contentIdeaId = idea.Id,
+                    platform = platform.ToString(),
+                    operation
+                },
+                cancellationToken);
+
             _logger.LogWarning(
                 "Content post {Operation} failed for idea {ContentIdeaId}, platform {Platform}, provider {Provider}, model {Model} after {DurationMilliseconds} ms with {FailureType}.",
                 operation,
@@ -455,9 +553,34 @@ public sealed class ContentPostService : IContentPostService
             }
 
             evaluated = ContentEvaluationValidator.ValidateAndNormalize(parsed);
+
+            await _aiRunRecorder.RecordSuccessAsync(
+                AIRunType.QualityEvaluation,
+                ContentEvaluationSystemPrompt.Version,
+                Stopwatch.GetElapsedTime(startedAt),
+                new
+                {
+                    contentPostId = post.Id,
+                    contentIdeaId = idea.Id,
+                    platform = post.Platform.ToString()
+                },
+                cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            await _aiRunRecorder.RecordFailureAsync(
+                AIRunType.QualityEvaluation,
+                ContentEvaluationSystemPrompt.Version,
+                Stopwatch.GetElapsedTime(startedAt),
+                exception,
+                new
+                {
+                    contentPostId = post.Id,
+                    contentIdeaId = idea.Id,
+                    platform = post.Platform.ToString()
+                },
+                cancellationToken);
+
             _logger.LogWarning(
                 "Content post evaluation failed for post {ContentPostId}, provider {Provider}, model {Model} after {DurationMilliseconds} ms with {FailureType}.",
                 post.Id,
@@ -605,7 +728,10 @@ public sealed class ContentPostService : IContentPostService
         Hashtags = post.Hashtags,
         ContentType = post.ContentType.ToString(),
         StorytellingStructure = post.StorytellingStructure,
-        CreatedAt = post.CreatedAt,
+    ScheduledAt = post.ScheduledAt,
+    PublishedAt = post.PublishedAt,
+    PublishFailureReason = post.PublishFailureReason?.ToString(),
+    CreatedAt = post.CreatedAt,
         UpdatedAt = post.UpdatedAt
     };
 }

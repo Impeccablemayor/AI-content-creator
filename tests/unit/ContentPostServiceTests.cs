@@ -186,7 +186,9 @@ public sealed class ContentPostServiceTests
         new(
             dbContext,
             CreateCurrentUser(workspaceId),
+            AuditLogTestContext.Create(dbContext, workspaceId),
             aiProvider,
+            AiRunTestContext.Create(dbContext, workspaceId),
             new ContentPostPromptBuilder(),
             new ContentEvaluationPromptBuilder(),
             new ContentRepetitionDetector(),
