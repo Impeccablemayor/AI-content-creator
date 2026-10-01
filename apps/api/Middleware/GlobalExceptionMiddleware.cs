@@ -2,8 +2,11 @@ using System.Net;
 using System.Text.Json;
 using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
+using Api.Application.ContentPillars;
 using Api.Application.ContentPosts;
+using Api.Application.SocialAccounts;
 using Api.Contracts.Responses;
+using Api.Application.Analytics;
 
 namespace Api.Middleware;
 
@@ -74,12 +77,48 @@ public class GlobalExceptionMiddleware
             ContentIdeaInvalidStatusException =>
                 (HttpStatusCode.Conflict, "CONTENT_IDEA_INVALID_STATUS",
                     "Only approved content ideas can be turned into posts."),
+            InvalidContentPostScheduleTimeException scheduleTimeException =>
+                (HttpStatusCode.BadRequest, "INVALID_CONTENT_POST_SCHEDULE_TIME",
+                    scheduleTimeException.Message),
+            InvalidContentPostTransitionException transitionException =>
+                (HttpStatusCode.Conflict, "INVALID_CONTENT_POST_TRANSITION",
+                    transitionException.Message),
             ContentEvaluationFailedException evaluationException =>
                 (HttpStatusCode.BadGateway, "CONTENT_EVALUATION_FAILED",
                     evaluationException.Message),
             InvalidContentIdeaRequestException requestException =>
                 (HttpStatusCode.BadRequest, "INVALID_CONTENT_IDEA_REQUEST",
                     requestException.Message),
+            UnsupportedSocialPlatformException platformException =>
+                (HttpStatusCode.BadRequest, "UNSUPPORTED_SOCIAL_PLATFORM",
+                    platformException.Message),
+            InvalidSocialOAuthStateException stateException =>
+                (HttpStatusCode.BadRequest, "INVALID_SOCIAL_OAUTH_STATE",
+                    stateException.Message),
+            InvalidSocialAccountTransitionException socialTransitionException =>
+                (HttpStatusCode.Conflict, "INVALID_SOCIAL_ACCOUNT_TRANSITION",
+                    socialTransitionException.Message),
+            SocialPlatformNotConfiguredException notConfiguredException =>
+                (HttpStatusCode.ServiceUnavailable, "SOCIAL_PLATFORM_NOT_CONFIGURED",
+                    notConfiguredException.Message),
+            SocialProviderAuthenticationException providerAuthenticationException =>
+                (HttpStatusCode.BadGateway, "SOCIAL_PROVIDER_AUTHENTICATION_FAILED",
+                    providerAuthenticationException.Message),
+            SocialProviderRequestException providerRequestException =>
+                (HttpStatusCode.BadGateway, "SOCIAL_PROVIDER_REQUEST_FAILED",
+                    providerRequestException.Message),
+            InvalidAnalyticsPeriodException periodException =>
+                (HttpStatusCode.BadRequest, "INVALID_ANALYTICS_PERIOD",
+                    periodException.Message),
+            InvalidContentPillarRequestException pillarRequestException =>
+                (HttpStatusCode.BadRequest, "INVALID_CONTENT_PILLAR_REQUEST",
+                    pillarRequestException.Message),
+            ContentPillarAudienceNotFoundException =>
+                (HttpStatusCode.BadRequest, "CONTENT_PILLAR_AUDIENCE_NOT_FOUND",
+                    "The target audience profile was not found in this workspace."),
+            DuplicateContentPillarNameException duplicateNameException =>
+                (HttpStatusCode.Conflict, "DUPLICATE_CONTENT_PILLAR_NAME",
+                    duplicateNameException.Message),
             _ => (HttpStatusCode.InternalServerError, "INTERNAL_SERVER_ERROR",
                 "An unexpected error occurred.")
         };
