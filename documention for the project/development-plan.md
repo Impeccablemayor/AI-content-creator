@@ -619,6 +619,20 @@ Community
 
 The user should be able to create, edit, activate, deactivate, and reorder pillars.
 
+**Status: implemented.** `content_pillars` is a real table with full CRUD at
+`/strategy/pillars`, workspace scoped. Reordering is expressed as `weight`, a
+percentage in `(0, 100]`, and the list is returned heaviest first, so "reorder"
+means "change the weights" rather than storing a separate ordinal. Activate and
+deactivate are the `isActive` flag. Names are unique per workspace, compared
+case-insensitively.
+
+`ContentStrategy.ContentPillars` still exists and is still free text. It is
+not replaced by the new table; nothing reads the two together, and the
+migration to drop the free-text column is separate work.
+
+Posting frequency, preferred platforms and CTA preferences remain design
+intent, as does the free-text content mix.
+
 ## Deliverable
 
 A workspace has a structured Brand Brain and Audience Brain that can be passed into AI generation.
@@ -918,6 +932,45 @@ OAuth tokens must:
 
 A user can securely connect and disconnect supported social accounts.
 
+## Implementation status
+
+**Connection management is implemented. Publishing is not.** The deliverable above
+is met; the publishing half of this phase belongs to Phase 10.
+
+The adapter shape actually built is a provider abstraction for the OAuth
+exchange, not the `ISocialPlatform` interface sketched above. `PublishAsync` is
+deliberately absent from this abstraction, because a connection and a publish
+have different lifecycles: a workspace connects an account once and publishes
+through it many times. Publishing is a separate abstraction in
+`Application/Publishing`, added with Phase 10:
+
+```text
+Application/SocialAccounts/
+├── ISocialPlatformProvider.cs          provider + resolver contracts
+├── OAuthSocialPlatformProvider.cs      shared code exchange, PKCE S256
+├── SocialPlatformProviders.cs          X and LinkedIn providers
+├── SocialOAuthStateStore.cs            single-use state + PKCE verifier
+└── SocialAccountService.cs             connect, callback, list, disconnect
+```
+
+| Capability | Status |
+| --- | --- |
+| OAuth authorization-code flow for X and LinkedIn | Implemented |
+| PKCE (`S256`) for X | Implemented |
+| Encrypted credential storage at rest | Implemented, separate purposes per token type |
+| Credentials never returned by the API | Implemented |
+| Credentials never logged | Implemented |
+| Connect, reconnect, list, disconnect | Implemented |
+| Disconnect destroys stored credentials | Implemented |
+| Token refresh | Not implemented, no refresh flow yet |
+| Revocation and `Revoked` state detection | Not implemented |
+| Platform content validation | Not implemented, belongs to Phase 10 |
+| Publishing | Implemented in Phase 10, see below |
+
+The OAuth callback returns a JSON envelope rather than redirecting to a frontend.
+It is browser-navigable, so a frontend redirect can be added later without
+changing the flow.
+
 ---
 
 # 15. Phase 10 — Scheduling and Publishing
@@ -962,6 +1015,18 @@ Schedule is valid
 Publication has not already succeeded
 ```
 
+**Implemented, with two checks collapsed.** The first two, the schedule, and the
+last all reduce to a single condition: only a `Scheduled` post whose time has
+come is a publish candidate, and the claim write requires that exact state.
+There is no separate variant row — a post is already per-platform — so the
+variant check does not exist.
+
+"Social account exists" is stricter than the sketch above: exactly **one**
+connected account must exist for the post's `(workspace, platform)`. Zero or more
+than one is a failure, not a guess. "Token is valid" covers both a known-expired
+token and a token the platform rejects, and there is no refresh: an expired token
+fails and the account must be reconnected.
+
 ## Worker
 
 The worker should process scheduled publications.
@@ -980,6 +1045,15 @@ External Platform
 Publication Result
 ```
 
+Implemented as `apps/worker`, which polls, claims due posts with a conditional
+update, publishes, and records the outcome under that same claim.
+
+The worker decrypts stored tokens, so it needs the same Data Protection key ring
+and application name as the API. If they differ, publishing fails with
+`CredentialsUnavailable` for every post. It also needs the same `Social` client
+configuration, because a platform with no configuration cannot publish even when
+a workspace is connected to it.
+
 ## Idempotency
 
 Publishing must be idempotent.
@@ -991,6 +1065,13 @@ Idempotency-Key
 ```
 
 and database-level safeguards to prevent accidental duplicate posts.
+
+**Not implemented, with the safeguards partially in place.** There is no
+`Idempotency-Key` and no publication row, so a crash between a successful
+publish and the status write can publish twice. What is implemented is the
+database-level safeguard: the claim is a single atomic conditional update, and
+every outcome write requires the caller's exact claim, so two workers cannot
+publish concurrently and a worker whose claim expired cannot overwrite a result.
 
 ## Retry policy
 
@@ -1006,9 +1087,28 @@ Invalid content       → Do not retry automatically
 Platform rejection    → Do not blindly retry
 ```
 
+**Not implemented as a policy.** There is no retry table, attempt counter, or
+backoff schedule. Retries happen only because a failed publish keeps its claim,
+so the existing claim expiry is the retry interval, and it applies uniformly
+regardless of whether the failure was recoverable.
+
+The distinction the policy calls for is recorded, though, in
+`PublishFailureReason`: `ProviderUnavailable` covers the retryable transient
+cases (timeout, rate limit, 5xx) separately from `CredentialsRejected` and
+`ProviderResponseInvalid`, which need a reconnect or a content fix. Acting on
+that difference is future work.
+
 ## Deliverable
 
 An approved post can be scheduled and reliably published to a connected social account.
+
+**Status: delivered**, with the limits above. Scheduling and publishing are
+implemented end to end and covered by tests, except that concurrent-claim
+atomicity and live platform behaviour are unverified: the test suite cannot
+execute the conditional database writes at all, because EF InMemory does not
+support `ExecuteUpdateAsync`, and no live LinkedIn or X credentials are
+available. See [The in-memory provider cannot execute the conditional write
+paths] in `tests/unit/ScheduledPostProcessorTests.cs`.
 
 ---
 
@@ -1017,6 +1117,29 @@ An approved post can be scheduled and reliably published to a connected social a
 ## Objective
 
 Capture what happens after publication.
+
+## Implementation status
+
+**The read surface and the capture half are both implemented.** The endpoints,
+the `content_post_metrics` table, the metric normalization rules, the workspace
+scoping and the `AnalyticsSync` worker that populates the table are built and
+tested. A metric reports `null` only when the platform does not expose it or has
+not reported it yet.
+
+| Capability | Status |
+|---|---|
+| `GET /analytics/overview` | Implemented |
+| `GET /analytics/posts` | Implemented |
+| `GET /analytics/posts/{contentPostId}` | Implemented |
+| `platform`, `from` and `to` filters | Implemented |
+| `pillarId` filter | Implemented, added with the `content_pillars` table |
+| Workspace scoping | Implemented, enforced by a composite foreign key |
+| Published-only counting | Implemented |
+| Latest-snapshot-per-post selection | Implemented |
+| `metric unavailable` / `= 0` / `not yet synchronized` kept distinct | Implemented via nullable columns and an attempt timestamp |
+| `AnalyticsSyncRequested` job and metric-fetching worker | Implemented, as a poll loop in `apps/worker/AnalyticsSyncWorkerService.cs` |
+| Storing the platform's post id so metrics can be fetched later | Implemented, `content_posts.published_external_post_id` |
+| Trend, platform-comparison and pillar breakdowns | Not implemented. The `pillarId` filter scopes existing totals to one pillar; it is not a grouped per-pillar comparison. |
 
 ## Metrics
 
@@ -1035,15 +1158,30 @@ Engagement Rate
 
 Not every platform will provide every metric.
 
-The system must preserve the distinction between:
+**Implemented.** Each metric is a nullable column, and the three states below
+survive a round trip through the API unchanged.
 
 ```text
-Metric unavailable
-Metric = 0
-Metric not yet synchronized
+Metric unavailable        → null
+Metric = 0                → 0
+Metric not yet synchronized → null, with recordedAt also null
 ```
 
-These are not the same state.
+The last one is now distinguishable from the other two. A successful read always
+writes a snapshot row, even when every value is `null`, so a non-null
+`recordedAt` with null metrics means "measured, platform reported nothing",
+while a null `recordedAt` means "no snapshot yet". A failed read writes no
+snapshot at all, so it never looks like a measurement of zero.
+
+`EngagementRate` is derived on read rather than stored, so a workspace-level
+rate can never disagree with its own inputs:
+
+```text
+(likes + comments + shares) / impressions * 100
+```
+
+Clicks, profile visits and followers are excluded. It is `null` when
+impressions are `null` or `0`.
 
 ## Analytics synchronization
 
@@ -1059,6 +1197,42 @@ The worker fetches platform metrics and updates:
 publication_metrics
 ```
 
+**Implemented.** `AnalyticsSyncProcessor` scans published posts whose
+`metrics_last_attempted_at` is null or older than `AnalyticsSync:ResyncIntervalHours`,
+reads their metrics through the same connected account that published them, and
+inserts a `content_post_metrics` snapshot. The worker polls on
+`AnalyticsSync:PollIntervalSeconds` with a batch of `AnalyticsSync:BatchSize`.
+
+Fetching a post's metrics requires the id the platform assigned it at publish
+time, so `content_posts.published_external_post_id` is written by the same
+conditional update that marks a post `Published`. Posts published before that
+column existed are never back-filled, because the platform ids cannot be
+recovered after the fact.
+
+The attempt timestamp is recorded before the platform is called, so a provider
+outage, a misconfiguration and a permanent "no data" answer all wait for the next
+resync interval instead of being retried on every poll. A post is deliberately
+not claimed: two overlapping workers could each write a snapshot, and the newest
+snapshot wins on read, so the duplicate is wasted work rather than wrong data.
+
+Platform coverage:
+
+- **X** — one request per post (`tweet.fields=public_metrics,non_public_metrics`)
+  returns impressions, likes, comments, shares and clicks. Private metrics need a
+  user-context token, which the connection flow already stores. Shares counts
+  reposts and quotes together because there is one shares column. X exposes no
+  per-post follower gain, so that metric stays null.
+- **LinkedIn** — `memberCreatorPostAnalytics` exposes one metric per request, so
+  a post costs seven calls. These metrics require LinkedIn's Community Management
+  API product, which is not part of the default connection scopes. Without it the
+  request is rejected and surfaces as a provider failure, leaving the post's
+  metrics empty rather than inventing zeros. Enabling it is a product-scope
+  decision, not a code change.
+
+The table this job writes is named `content_post_metrics`, keyed by
+`ContentPostId` rather than `PublicationId`, since there is no publication
+entity.
+
 ## Dashboard
 
 Display:
@@ -1073,9 +1247,21 @@ Display:
 
 Avoid claiming causation where the data only shows correlation.
 
+**Partially available.** Total published posts, engagement, reach and
+per-post performance are readable today, and metric ingestion now populates them.
+Platform comparison, content pillar performance and recent trends are not built.
+LinkedIn figures additionally require the Community Management API product; X
+figures work with the existing connection scopes.
+
 ## Deliverable
 
 Users can see measurable performance of published content.
+
+**Status: delivered**, with the platform-coverage caveat above. The read surface,
+the metric capture pipeline and the published-post identifier are implemented end
+to end and covered by tests. Live platform behaviour is unverified: no LinkedIn
+or X credentials are available in this environment, and the conditional database
+writes are verified against PostgreSQL rather than by the unit suite.
 
 ---
 
@@ -1121,6 +1307,64 @@ Learning signals should be evidence-based.
 
 The system should not automatically make major strategic changes from a single post.
 
+### What is built
+
+One dimension is compared per finding, and a finding is only produced when the
+evidence supports it:
+
+```text
+PLATFORM_ENGAGEMENT
+CONTENT_TYPE_ENGAGEMENT
+CONTENT_PILLAR_ENGAGEMENT
+POSTING_DAY_ENGAGEMENT
+```
+
+The rest of the list above is the target vocabulary, not delivered behaviour.
+Topic, hook, CTA, and storytelling comparisons need text and structure the system
+does not measure yet, and a signal derived from a proxy would be stored and read
+back as though it were a finding. They stay unwired until there is something real
+behind them.
+
+### How a signal is decided
+
+The system says less than it could, on purpose:
+
+- only posts with a real metric snapshot count as measured; a post nobody has
+  read metrics for contributes no evidence, and is reported in the run's counts
+  rather than quietly dropped;
+- a group needs at least two posts and a derivable engagement rate, so a group of
+  one is never compared and a group with no reported impressions is never ranked
+  as zero;
+- a dimension is reported only when its strongest group clears a configured
+  margin over its weakest, so a two-percent difference costs no AI call;
+- the observation sentence is written by code from the metric totals, so it can
+  only state what was measured, and the model's answer is stored beside it as an
+  inference rather than merged into it;
+- nothing claims a cause. Posts differ in many ways at once, so a comparison is a
+  correlation, and the prompt tells the model to recommend something to try
+  rather than to assert a cause.
+
+The last point is the operational form of "the system should not automatically
+make major strategic changes from a single post": nothing here changes strategy
+at all. Signals are recorded and readable, and no generation path consumes them
+yet.
+
+### Insufficient data is a result, not an error
+
+A workspace with too little measured history gets a completed run that reports
+`hasSufficientData: false`, the counts that produced that answer, and an empty
+list. No AI call is made and no row is written. Returning a fabricated finding
+for two posts would be the failure mode this threshold exists to prevent.
+
+### The run is triggered by a request, not the worker
+
+`POST /api/v1/learning/insights` runs the loop; `GET` reads the results. A run
+makes AI calls, and every other AI operation in the system is request-triggered.
+An AI run row is also recorded against the workspace of the request that caused
+it, and the worker has no request and therefore no workspace to record against.
+Running it in the worker would mean inventing a workspace-explicit run recorder
+and a background AI configuration to serve a loop the publisher asks for anyway.
+
 ## Exploration vs exploitation
 
 The AI should balance:
@@ -1136,6 +1380,13 @@ The system should continue testing new ideas instead of repeating the same forma
 ## Deliverable
 
 Performance data influences future content recommendations.
+
+Status: the first half is delivered and the second is not. Performance data is
+analysed and stored as learning signals, and the signals are readable. No
+recommendation path consumes them yet, so a measured difference does not yet
+change what gets generated. That is the remaining work in this phase, and it is
+deliberately separate: wiring generation to weak signals would let a handful of
+posts quietly steer output, which is the failure this phase is meant to avoid.
 
 ---
 
@@ -1494,6 +1745,15 @@ Jobs should support:
 - Cancellation where appropriate.
 - Logging.
 - Dead-letter/failure handling.
+
+`PerformanceAnalysisJob` and `LearningSignalJob` are not built, and the list
+above is the target rather than the current state. The worker owns jobs that must
+run whether or not anyone asks, and the learning loop does not: it is triggered by
+`POST /api/v1/learning/insights`, because a run makes AI calls and its AI run row
+is recorded against the workspace of the request that caused it — neither of which
+a poll has. A scheduled learning job becomes worth building when signals need to
+appear without being asked for; at that point it needs a workspace-explicit run
+recorder, which is the real work, not the scheduling.
 
 ---
 

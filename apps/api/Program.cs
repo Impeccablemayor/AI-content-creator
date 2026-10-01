@@ -9,9 +9,16 @@ using System.Text;
 using Api.Application.Authentication;
 using Api.Application.AI;
 using Api.Application.AI.Prompts;
+using Api.Application.Analytics;
+using Api.Application.AuditLogs;
 using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
+using Api.Application.ContentPillars;
+using Api.Application.Learning;
+using Api.Application.Scheduling;
+using Api.Application.Security;
 using Api.Application.Services;
+using Api.Application.SocialAccounts;
 using Api.Contracts.ContentPost;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
@@ -54,16 +61,22 @@ builder.Services
         "Redis connection string is required.")
     .ValidateOnStart();
 
-builder.Services.AddSingleton<IConnectionMultiplexer>(serviceProvider =>
-{
-    var redisOptions = serviceProvider
-        .GetRequiredService<
-            Microsoft.Extensions.Options.IOptions<RedisOptions>>()
-        .Value;
+// One lazily created Redis connection, shared by the health check and the
+// distributed cache used for single-use OAuth state.
+var configuredRedisOptions = builder.Configuration
+    .GetSection(RedisOptions.SectionName)
+    .Get<RedisOptions>()
+    ?? new RedisOptions();
+var redisMultiplexer = new Lazy<Task<IConnectionMultiplexer>>(
+    () => Task.FromResult<IConnectionMultiplexer>(
+        ConnectionMultiplexer.Connect(configuredRedisOptions.ConnectionString)));
 
-    return ConnectionMultiplexer.Connect(
-        redisOptions.ConnectionString);
-});
+builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+    redisMultiplexer.Value.GetAwaiter().GetResult());
+
+// Shared cache for short-lived server state such as single-use OAuth state.
+builder.Services.AddStackExchangeRedisCache(options =>
+    options.ConnectionMultiplexerFactory = () => redisMultiplexer.Value);
 
 // Framework services
 builder.Services
@@ -166,11 +179,44 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<CurrentUserService>();
 builder.Services.AddScoped<JwtTokenService>();
 builder.Services.AddScoped<IContentIdeaService, ContentIdeaService>();
+builder.Services.AddScoped<IContentPillarService, ContentPillarService>();
+builder.Services.AddScoped<IAuditLogService, AuditLogService>();
+builder.Services
+    .AddOptions<SchedulingOptions>()
+    .Bind(builder.Configuration.GetSection(SchedulingOptions.SectionName))
+    .Validate(
+        options => options.PollIntervalSeconds is >= 1 and <= 3600,
+        "Scheduling poll interval must be between 1 and 3600 seconds.")
+    .Validate(
+        options => options.BatchSize is >= 1 and <= 500,
+        "Scheduling batch size must be between 1 and 500.")
+    .Validate(
+        options => options.ClaimExpiryMinutes is >= 1 and <= 1440,
+        "Scheduling claim expiry must be between 1 and 1440 minutes.")
+    .ValidateOnStart();
+
 builder.Services.AddScoped<IContentPostService, ContentPostService>();
+builder.Services.AddScoped<IAiRunRecorder, AiRunRecorder>();
 builder.Services.AddSingleton<ContentIdeaPromptBuilder>();
 builder.Services.AddSingleton<ContentPostPromptBuilder>();
 builder.Services.AddSingleton<ContentEvaluationPromptBuilder>();
 builder.Services.AddSingleton<ContentRepetitionDetector>();
+
+// Scheduling and publishing are deliberately absent here. The worker owns both:
+// it is the only host that needs AddSocialPublishing, and the only host that
+// runs ScheduledPostWorkerService. Registering the processor in the API created
+// a dependency on IScheduledPostPublishService, which only the worker registers,
+// so the API could not build. Nothing in the API resolves either interface, so
+// nothing is lost by leaving them to the worker.
+
+builder.Services.AddScoped<IPublishedPostMetricsReader, PublishedPostMetricsReader>();
+builder.Services.AddScoped<IAnalyticsService, AnalyticsService>();
+builder.Services.AddLearning(builder.Configuration);
+
+builder.Services.AddSocialCredentialProtection(
+    builder.Configuration,
+    builder.Environment);
+builder.Services.AddConfiguredSocialPlatformProviders(builder.Configuration);
 
 var app = builder.Build();
 

@@ -813,6 +813,17 @@ Before publishing:
 
 Only then should the worker call the platform API.
 
+**Implemented as follows.** Checks 1, 2, 6, and 7 collapse into one
+requirement: only a `Scheduled` post whose time has come is a publish candidate,
+and the worker's claim write requires that exact state. Check 3 becomes exactly
+one connected account for the post's `(workspace, platform)`, and check 4 covers
+both a known-expired token and a token the platform rejects. Check 5 is limited
+to the text being non-empty and the platform being configured.
+
+A post that fails any check is not published and is not retried immediately: it
+keeps its claim and records a `PublishFailureReason`, so the next attempt waits
+for the claim to expire.
+
 ---
 
 # 31. Idempotency
@@ -836,6 +847,21 @@ Example:
 ```text
 publish-job-7f92...
 ```
+
+**Not implemented.** There is no idempotency key, no publication row, and no
+stored platform post id, so a crash between a successful publish and the status
+write can leave a post that is published externally but still `Scheduled`
+locally. The worker will pick it up again once the claim expires and publish it
+a second time.
+
+What is implemented is narrower: the claim write is a single conditional
+database update, so two workers cannot publish the same post at the same time,
+and every outcome write requires the caller's exact claim, so a worker whose
+claim expired cannot overwrite another worker's result. Both bound concurrent
+duplication; neither bounds duplication across a crash.
+
+Closing this needs either a stored external post id to reconcile against, or
+platform-side idempotency where the provider supports it. Both are deferred.
 
 ---
 

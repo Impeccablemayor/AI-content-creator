@@ -480,6 +480,12 @@ Idempotency-Key: 7c8e2...
 
 The backend must prevent duplicate execution when the same key is reused for the same operation.
 
+**Not implemented.** No current endpoint takes an `Idempotency-Key`, and
+`POST /publications` is deferred. Scheduled publishing relies on the worker's
+claim lease for single-writer behaviour instead, which prevents two workers from
+publishing concurrently but does not make publishing exactly-once across a
+crash.
+
 ---
 
 # 16. Users
@@ -712,13 +718,47 @@ Creates or updates the workspace content strategy.
 
 ## GET `/strategy/pillars`
 
-Returns content pillars.
+Returns content pillars, heaviest `weight` first and then by name so the order
+is stable across identical calls.
+
+### Filters
+
+```text
+isActive
+```
+
+### Response
+
+```json
+{
+  "id": "…",
+  "name": "AI for Business",
+  "description": "Practical ways businesses can use AI.",
+  "objective": "Establish credibility with operations leaders.",
+  "audienceProfileId": "…",
+  "weight": 30.00,
+  "isActive": true,
+  "ideaCount": 12,
+  "createdAt": "2026-09-30T00:00:00Z",
+  "updatedAt": "2026-09-30T00:00:00Z"
+}
+```
+
+`ideaCount` is how many content ideas are currently attributed to the pillar.
+Pillars belonging to other workspaces are never returned.
+
+---
+
+## GET `/strategy/pillars/{pillarId}`
+
+Returns one content pillar. Returns `404 CONTENT_PILLAR_NOT_FOUND` when the
+pillar does not exist in the caller's workspace.
 
 ---
 
 ## POST `/strategy/pillars`
 
-Creates a content pillar.
+Creates a content pillar. Returns `201` with the created pillar.
 
 ### Request
 
@@ -726,21 +766,77 @@ Creates a content pillar.
 {
   "name": "AI for Business",
   "description": "Practical ways businesses can use AI.",
-  "priority": 1
+  "objective": "Establish credibility with operations leaders.",
+  "audienceProfileId": "…",
+  "weight": 30.00,
+  "isActive": true
 }
 ```
+
+`name` and `weight` are required. `weight` is a percentage in `(0, 100]`;
+`objective`, `audienceProfileId` and `isActive` are optional, and `isActive`
+defaults to `true`. Omitted `description` becomes an empty string rather than
+`null`.
+
+> **Deviation from the original sketch.** That sketch sent `"priority": 1`, an
+> integer ordering key. The database schema specifies `Weight DECIMAL(5,2)` —
+> "how frequently a pillar should appear relative to others" — which is a
+> proportion, not an ordering. An ordinal `priority` would also be redundant:
+> response order is derived from `weight`. The implemented field is therefore
+> `weight`, matching the schema, rather than adding a second field that would
+> disagree with it.
+
+### Errors
+
+| Status | Code | Cause |
+|---|---|---|
+| 400 | `INVALID_CONTENT_PILLAR_REQUEST` | Missing or out-of-range `name` or `weight` |
+| 400 | `CONTENT_PILLAR_AUDIENCE_NOT_FOUND` | `audienceProfileId` is not in this workspace |
+| 409 | `DUPLICATE_CONTENT_PILLAR_NAME` | A pillar with this name already exists in this workspace |
+
+Names are compared case-insensitively, so "education" and "Education" are the
+same name. `audienceProfileId` must belong to the caller's workspace; the
+database cannot enforce this because `audience_profiles` allows only one
+profile per workspace, so it is checked in the service.
 
 ---
 
 ## PATCH `/strategy/pillars/{pillarId}`
 
-Updates a content pillar.
+Updates a content pillar. Every field is optional and only the fields that are
+supplied are changed, so a caller can reweight a pillar without resending its
+name.
+
+### Request
+
+```json
+{
+  "name": "AI for Business",
+  "weight": 40.00,
+  "isActive": false
+}
+```
+
+### Errors
+
+| Status | Code | Cause |
+|---|---|---|
+| 400 | `INVALID_CONTENT_PILLAR_REQUEST` | Out-of-range `name` or `weight` |
+| 400 | `CONTENT_PILLAR_AUDIENCE_NOT_FOUND` | `audienceProfileId` is not in this workspace |
+| 404 | `CONTENT_PILLAR_NOT_FOUND` | No such pillar in this workspace |
+| 409 | `DUPLICATE_CONTENT_PILLAR_NAME` | Renamed onto an existing pillar's name |
 
 ---
 
 ## DELETE `/strategy/pillars/{pillarId}`
 
-Deletes a content pillar.
+Deletes a content pillar. Returns `204`, or `404 CONTENT_PILLAR_NOT_FOUND` when
+the pillar does not exist in the caller's workspace.
+
+Deleting a pillar never deletes content. Ideas attributed to it are kept and
+have their `contentPillarId` set to `null`, in the same transaction as the
+delete. A pillar with ideas is therefore deleted in one call — no need to
+reassign the ideas first.
 
 ---
 
@@ -765,6 +861,13 @@ Example:
 ```http
 GET /api/v1/content/ideas?status=New&pillarId=uuid
 ```
+
+> `status`, `pillarId` and `platform` are implemented. `source`,
+> `createdFrom` and `createdTo` are not: ideas have no `source` column, and
+> there is no created-at range filter. Each response item reports the
+> `contentPillarId` it is attributed to, which is `null` when the idea has not
+> been attributed to a pillar. Passing a `pillarId` that does not exist in the
+> caller's workspace returns an empty list rather than an error.
 
 ---
 
@@ -989,6 +1092,7 @@ and rejecting generated posts:
 | `POST` | `/api/v1/content-posts/{id}/regenerate` | Rerun generation on the same post |
 | `POST` | `/api/v1/content-posts/{id}/approve` | Approve a draft |
 | `POST` | `/api/v1/content-posts/{id}/reject` | Reject a draft |
+| `POST` | `/api/v1/content-posts/{id}/schedule` | Schedule or reschedule an approved post |
 | `POST` | `/api/v1/content-posts/{id}/evaluate` | Request a quality evaluation |
 
 All routes require authentication and are scoped to the authenticated user's
@@ -1064,14 +1168,110 @@ Every response uses the standard API envelope. A post payload includes `id`,
 `updatedAt`. Successful edits, regenerations, approvals, and rejections advance
 `updatedAt`; `createdAt` is never changed.
 
+Responses also include two nullable fields describing the publish outcome, both
+maintained by the worker rather than by any request: `publishedAt` and
+`publishFailureReason`. See [Scheduled publishing](#scheduled-publishing).
+
 | Code | Condition |
 | --- | --- |
 | `404 CONTENT_POST_NOT_FOUND` | Unknown id, or a post in another workspace |
 | `409 INVALID_CONTENT_POST_TRANSITION` | The current status forbids the operation |
 | `400 INVALID_CONTENT_POST_CONTENT` | Edited content failed shared validation |
 
-Scheduling, publishing, variants, and approval history are not part of this
-workflow and are not yet implemented.
+Variants and approval history are not part of this workflow and are not yet
+implemented.
+
+#### Scheduling
+
+`POST /api/v1/content-posts/{id}/schedule` records when a post is intended to
+be published.
+
+```json
+{
+  "scheduledAt": "2026-06-01T09:30:00Z"
+}
+```
+
+Scheduling and scheduled publishing are implemented. There is no request that
+publishes on demand; a post goes out only through its schedule.
+
+| Code | Condition |
+| --- | --- |
+| `400 INVALID_CONTENT_POST_SCHEDULE_TIME` | `scheduledAt` is not in the future |
+| `404 CONTENT_POST_NOT_FOUND` | Unknown id, or a post in another workspace |
+| `409 INVALID_CONTENT_POST_TRANSITION` | The post status does not allow scheduling |
+
+On success the post moves to `Scheduled`, `scheduledAt` is stored, `updatedAt`
+advances, and the post content is preserved byte for byte. A successful
+schedule also clears any previous publish claim so a rescheduled post can be
+claimed again when it becomes due.
+
+| Current status | Schedule |
+| --- | --- |
+| `Approved` | yes, moves to `Scheduled` |
+| `Scheduled` | yes, reschedules and stays `Scheduled` |
+| `Draft` | no, must be approved first |
+| `Rejected` | no, must be approved again first |
+| `Published` | no |
+
+`scheduledAt` must be strictly in the future. A client cannot set `status` or
+`scheduledAt` through `PATCH`; the update contract exposes only content fields.
+
+Responses now include a nullable `scheduledAt`, a nullable `publishedAt`, and a
+nullable `publishFailureReason`. `publishClaimedAt` is internal worker bookkeeping
+and is never exposed.
+
+#### Scheduled post worker
+
+`apps/worker` polls for due scheduled posts, claims them, and publishes them. It
+is orchestration only; all scheduling and publishing rules live in the
+application layer.
+
+Each poll:
+
+1. Selects posts that are `Scheduled` and whose `scheduledAt` is at or before
+   now, oldest first, bounded by the configured batch size.
+2. Claims each one with a conditional update, so two workers cannot both win the
+   same post.
+3. Logs the claim with the post, workspace, idea, and platform.
+4. Publishes the claimed post through the workspace's connected account, then
+   records the outcome under that same claim.
+
+A post that throws unexpectedly does not abandon the rest of the batch. It is
+counted as not published, and because its claim is already recorded it becomes
+eligible again when that claim expires.
+
+The worker is system-scoped, not user-scoped: it scans across workspaces,
+because a background job is not acting on behalf of one request. Each post is
+claimed individually and logged with its own workspace, and no workspace's
+content is ever attributed to another.
+
+Configuration:
+
+```json
+{
+  "Scheduling": {
+    "PollIntervalSeconds": 30,
+    "BatchSize": 25,
+    "ClaimExpiryMinutes": 15
+  }
+}
+```
+
+A claim is a lease. If a worker dies mid-claim, the post becomes claimable
+again once the claim is older than `ClaimExpiryMinutes`. This keeps a crashed
+worker from stranding a post forever, and it doubles as the retry backoff: a
+failed publish keeps its claim, so it is not attempted again until the claim
+expires.
+
+Multi-instance safety comes from the atomic conditional update in the database,
+not from Redis. Redis exists in this solution only as a health check, and adding
+a distributed lock layer before a publishing subsystem exists would be
+premature.
+
+Deliberately not implemented: manual publish, unscheduling a post, publication
+history or a per-attempt record, calendar or drag-to-reschedule UX, token
+refresh, and content variants or A/B testing.
 
 #### Quality evaluation
 
@@ -1365,7 +1565,6 @@ Returns research job status and results when completed.
 Returns stored research sources.
 
 ---
-
 # 32. Social Accounts
 
 Social accounts represent external accounts connected to the workspace.
@@ -1375,11 +1574,37 @@ Supported V1 platforms:
 - X
 - LinkedIn
 
+**Connection management is implemented. Publishing is not.** A connected account
+stores an authorized, encrypted credential so the system can act as that account
+later, but nothing is posted to the platform yet.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/social/accounts` | List the workspace's connected accounts |
+| `GET` | `/api/v1/social/{platform}/connect` | Start the OAuth flow |
+| `GET` | `/api/v1/social/{platform}/callback` | OAuth redirect target |
+| `DELETE` | `/api/v1/social/accounts/{id}` | Disconnect and destroy credentials |
+
+`{platform}` accepts `x` or `linkedin`, case-insensitively. Any other value is
+rejected with `400 SOCIAL_PLATFORM_NOT_SUPPORTED`. Platform matching is not
+fuzzy, so `twitter` and `facebook` are not accepted as aliases.
+
+Account status values:
+
+| Status | Meaning |
+| --- | --- |
+| `Connected` | Authorized and usable |
+| `Expired` | The stored credential is past its expiry |
+| `Revoked` | The platform withdrew access |
+| `Error` | The last connection attempt failed |
+| `Disconnected` | Credentials were destroyed; the row is kept as history |
+
 ---
 
-## GET `/social/accounts`
+## GET `/api/v1/social/accounts`
 
-Returns connected social accounts.
+Returns the calling workspace's connected social accounts. Requires
+authentication.
 
 Example response:
 
@@ -1389,53 +1614,120 @@ Example response:
     {
       "id": "uuid",
       "platform": "LinkedIn",
-      "accountName": "Mayorx Tech",
+      "username": "mayorx-tech",
+      "displayName": "Mayorx Tech",
+      "profileUrl": "https://www.linkedin.com/company/mayorx-tech",
       "status": "Connected",
-      "connectedAt": "2026-09-25T18:30:00Z"
+      "tokenExpiresAt": "2026-10-02T18:30:00Z",
+      "connectedAt": "2026-09-25T18:30:00Z",
+      "updatedAt": "2026-09-25T18:30:00Z"
     }
-  ]
+  ],
+  "message": "Social accounts retrieved successfully."
 }
 ```
 
-Sensitive OAuth tokens must never be returned.
+**Sensitive OAuth tokens must never be returned.** The response contract has no
+access token, refresh token, or encrypted-credential property of any kind, and
+`tokenExpiresAt` is the only token-related field exposed.
+
+Accounts are scoped to the caller's workspace. An account belonging to another
+workspace is never listed, readable, or disconnectable.
 
 ---
 
-# 33. OAuth Connection
+## GET `/api/v1/social/{platform}/connect`
 
-## GET `/social/{platform}/connect`
+Starts the OAuth flow and returns the provider authorization URL as JSON. A
+client is expected to redirect the browser to `authorizationUrl`.
 
-Returns or redirects to the OAuth authorization flow.
+Requires authentication. The redirect URI sent to the provider is read from
+server configuration only; it is never taken from the request.
 
-Supported values:
-
-```text
-x
-linkedin
+```json
+{
+  "data": {
+    "platform": "LinkedIn",
+    "authorizationUrl": "https://www.linkedin.com/oauth/v2/authorization?...",
+    "expiresAt": "2026-09-30T12:10:00Z"
+  },
+  "message": "Social authorization URL created."
+}
 ```
 
----
+X uses PKCE with `S256`; the verifier is stored with the state and never leaves
+the server. LinkedIn's authorization-code flow does not use PKCE.
 
-## GET `/social/{platform}/callback`
+| Code | Condition |
+| --- | --- |
+| `400 SOCIAL_PLATFORM_NOT_SUPPORTED` | The platform is not X or LinkedIn |
+| `503 SOCIAL_PLATFORM_NOT_CONFIGURED` | The platform has no client credentials |
+| `502 SOCIAL_PROVIDER_ERROR` | The provider rejected the request |
 
-Handles the OAuth callback.
-
-The callback must:
-
-1. Validate state
-2. Exchange authorization code
-3. Retrieve account information
-4. Encrypt tokens
-5. Store/update the social account
-6. Redirect the user back to the application
+A platform with no credentials is reported as not configured rather than failing
+mid-flow. Partially configured platforms are rejected at startup.
 
 ---
 
-## DELETE `/social/accounts/{accountId}`
+## GET `/api/v1/social/{platform}/callback`
 
-Disconnects a social account.
+The OAuth redirect target. **This endpoint is anonymous by design**: the
+provider redirects the browser here without an `Authorization` header.
 
-Before deletion, scheduled content targeting that account should be identified and handled safely.
+The workspace is therefore taken from the stored, single-use OAuth state and
+never from the caller. Requesting another workspace's account is not possible
+without that workspace's state value.
+
+Query parameters: `code`, `state`, and `error`.
+
+The callback:
+
+1. Rejects a provider-reported `error` with `400 SOCIAL_OAUTH_DENIED`
+2. Validates the single-use `state` and reads the workspace and platform from it
+3. Exchanges the authorization code
+4. Retrieves the provider profile
+5. Encrypts the tokens
+6. Creates or updates the social account in the state's workspace
+
+The callback currently returns a JSON success envelope rather than redirecting to
+a frontend. It is designed to be browser-navigable, so a frontend redirect can
+be added without changing the flow.
+
+| Code | Condition |
+| --- | --- |
+| `400 SOCIAL_OAUTH_DENIED` | The provider returned an error |
+| `400 SOCIAL_STATE_INVALID` | The state is missing, unknown, expired, or already used |
+| `400 SOCIAL_AUTHORIZATION_CODE_MISSING` | No `code` was supplied |
+| `400 SOCIAL_PLATFORM_MISMATCH` | The state was issued for a different platform |
+| `503 SOCIAL_PLATFORM_NOT_CONFIGURED` | The platform has no client credentials |
+| `502 SOCIAL_PROVIDER_ERROR` | Token exchange or profile lookup failed |
+
+The state is consumed before it is used, so a replayed callback fails. Provider
+error details, including token endpoint response bodies, are never logged or
+returned.
+
+Reconnecting an account that is already connected re-authorizes it in place
+instead of creating a duplicate.
+
+---
+
+## DELETE `/api/v1/social/accounts/{id}`
+
+Disconnects a social account. Requires authentication.
+
+On success the account moves to `Disconnected` and its stored access and refresh
+tokens are destroyed. The row is kept as connection history rather than deleted,
+so `platformAccountId` cannot silently be reconnected under a new account id.
+
+| Code | Condition |
+| --- | --- |
+| `404 SOCIAL_ACCOUNT_NOT_FOUND` | Unknown id, or an account in another workspace |
+| `409 SOCIAL_ACCOUNT_NOT_DISCONNECTABLE` | The account is already disconnected |
+
+A disconnected account can be reconnected, which creates a fresh authorization
+and a new credential. Scheduled content that referenced a disconnected account
+still needs to be handled safely when publishing is implemented; that handling is
+not part of this milestone.
 
 ---
 
@@ -1502,85 +1794,113 @@ Cancels a scheduled publication.
 
 # 35. Publishing
 
-## POST `/publications`
+Publishing itself is implemented, but only as part of the scheduled post worker.
+There is **no publication HTTP API**. A post is published by being scheduled and
+becoming due; nothing triggers a publish from a request.
 
-Immediately publishes approved content.
+What a content post exposes is its outcome, on the post itself:
 
-### Request
+| Field | Meaning |
+| --- | --- |
+| `status` | `Published` once the platform accepted the post |
+| `publishedAt` | When that happened |
+| `publishFailureReason` | Why the last attempt failed, or `null` |
 
-```json
-{
-  "contentVariantId": "uuid",
-  "socialAccountId": "uuid"
-}
-```
+A failed publish does **not** change `status`. The post stays `Scheduled` with a
+recorded `publishFailureReason`, and it is attempted again once its claim
+expires. This is what distinguishes "nothing is wrong" from "this keeps failing
+and here is why".
 
-Headers:
+`publishFailureReason` is one of:
 
-```http
-Idempotency-Key: unique-operation-key
-```
+| Value | Meaning |
+| --- | --- |
+| `PlatformNotSupported` | No publisher exists for the platform |
+| `PlatformNotConfigured` | The platform has no client configuration |
+| `SocialAccountNotFound` | The workspace has no account for the platform |
+| `SocialAccountNotConnected` | Accounts exist, but none is connected |
+| `SocialAccountAmbiguous` | More than one connected account, so the target is unclear |
+| `CredentialsUnavailable` | No stored token, or it could not be decrypted |
+| `CredentialsExpired` | The token is past its expiry, or the account is expired |
+| `CredentialsRejected` | The platform refused the stored credentials |
+| `ProviderUnavailable` | Timeout, rate limit, or provider error; retrying may work |
+| `ProviderResponseInvalid` | The platform rejected the publish or replied unreadably |
+| `PublishClaimLost` | Another worker owned the post when the outcome was written |
+| `ContentPostNotScheduled` | The post was not in a publishable state when the attempt ran |
 
-### Response
+Account selection is by `(workspace, platform)`. Exactly one connected account
+must exist: none, or more than one, is a failure rather than a guess, because
+picking one of several accounts would publish to an account nobody chose.
 
-```json
-{
-  "data": {
-    "publicationId": "uuid",
-    "status": "Publishing"
-  },
-  "message": "Publication started"
-}
-```
+The published text is composed deterministically from the post's `content`, its
+optional `callToAction`, and its `hashtags`, joined by blank lines. A missing
+part is omitted rather than leaving a gap, so there are no variants and nothing
+is randomised between attempts.
 
-**Status:** `202 Accepted`
+## Deferred
 
-Publishing is asynchronous because external platform APIs may take time or fail.
+The following remain design intent and are **not implemented**:
 
----
-
-## GET `/publications`
-
-Returns publication history.
-
-Filters:
-
-```text
-platform
-status
-from
-to
-```
-
----
-
-## GET `/publications/{publicationId}`
-
-Returns publication details.
-
-Example:
-
-```json
-{
-  "data": {
-    "id": "uuid",
-    "platform": "LinkedIn",
-    "status": "Published",
-    "publishedAt": "2026-09-25T18:30:00Z",
-    "externalPostId": "external-id"
-  }
-}
-```
+- `POST /publications` — on-demand publishing with an `Idempotency-Key`.
+- `GET /publications` and `GET /publications/{id}` — publication history.
+  There is no `publications` table, so there is no per-attempt record. The
+  platform's post id for the successful publish is stored on
+  `content_posts.published_external_post_id`, so metrics can be fetched for it,
+  but the publish attempts themselves are not kept.
+- Token refresh. A publish uses the stored access token as-is; an expired token
+  fails rather than being renewed.
+- Exactly-once publishing. If a worker dies after the platform accepted a post
+  but before the status is written, the post stays `Scheduled` and may be
+  published again.
 
 ---
 
 # 36. Analytics
 
+> **Implementation note.** Analytics is implemented as a **read-only reporting
+> surface** over a `content_post_metrics` table, and the metric **ingestion**
+> pipeline described in the roadmap ("Analytics synchronization", a worker that
+> fetches platform metrics) is implemented as well. A metric reports `null` only
+> when the platform does not expose it or has not reported it yet.
+>
+> Metrics are read with the same access token that published the post, so the
+> platform's own post id is stored at publish time on
+> `content_posts.published_external_post_id`. Posts published before that column
+> existed are never back-filled and stay unmeasured.
+>
+> X exposes every metric below except per-post follower gain, in one request per
+> post. LinkedIn exposes them through `memberCreatorPostAnalytics`, which
+> requires the Community Management API product and is therefore optional per
+> deployment; without it the post's metrics stay `null` rather than being
+> reported as zero.
 ## GET `/analytics/overview`
 
 Returns high-level workspace analytics.
 
-Example:
+```http
+GET /api/v1/analytics/overview?platform=LinkedIn&from=2026-09-01T00:00:00Z&to=2026-09-25T23:59:59Z&pillarId=…
+```
+
+All four query parameters are optional.
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `platform` | `LinkedIn` \| `X` | Restricts to one platform |
+| `from` | ISO-8601 | Inclusive lower bound on `PublishedAt` |
+| `to` | ISO-8601 | Inclusive upper bound on `PublishedAt` |
+| `pillarId` | UUID | Restricts to posts whose originating idea is attributed to this pillar |
+
+A post has no pillar of its own, so `pillarId` reaches through the idea the post
+was generated from. Ideas that were never attributed to a pillar, and pillars
+from other workspaces, are excluded. This was previously documented as
+deferred because no pillar table existed to reference; it is now available
+because `content_pillars` is implemented.
+
+Omitting `from` and `to` means **all time**, not a default window; the `period`
+in the response then reports `null` bounds so the caller can see which window
+was actually used.
+
+Example (no metric data recorded yet, so every metric is `null`):
 
 ```json
 {
@@ -1590,16 +1910,52 @@ Example:
       "to": "2026-09-25T23:59:59Z"
     },
     "postsPublished": 18,
-    "impressions": 45200,
-    "likes": 1800,
-    "comments": 320,
-    "shares": 210,
-    "clicks": 540,
-    "followersGained": 380,
-    "engagementRate": 5.1
+    "impressions": null,
+    "likes": null,
+    "comments": null,
+    "shares": null,
+    "clicks": null,
+    "profileVisits": null,
+    "followersGained": null,
+    "engagementRate": null
   }
 }
 ```
+
+`profileVisits` is not in the original sketch of this response but is listed as
+a normalized metric by the development plan and as a column by the database
+schema, so it is included.
+
+### What `null` means
+
+Every metric is nullable, and that is deliberate. The design requires three
+states to stay distinct, and a single number cannot carry them:
+
+| Reported value | Meaning |
+|---|---|
+| `null` | Unknown. No published post in the period has reported this metric. |
+| `0` | Measured. A platform reported that the value really is zero. |
+| a number | Measured. |
+
+`postsPublished` is always a number, because the count comes from the posts
+table rather than from any platform.
+
+### `engagementRate`
+
+Derived, never stored:
+
+```text
+engagementRate = (likes + comments + shares) / impressions * 100
+```
+
+Two consequences worth knowing:
+
+- It is `null` when `impressions` is `null` or `0`, because no rate is defined
+  then — even if every other metric was genuinely measured.
+- Clicks, profile visits and followers are **excluded**. They describe reach and
+  audience growth rather than engagement with the post.
+- It is computed from the summed totals, not as an average of per-post rates.
+  Averaging would weight a post with 3 impressions the same as one with 30,000.
 
 ---
 
@@ -1607,28 +1963,133 @@ Example:
 
 Returns post-level performance.
 
-Supported filters:
-
-```text
-platform
-from
-to
-pillarId
+```http
+GET /api/v1/analytics/posts?platform=X&from=2026-09-01T00:00:00Z&to=2026-09-30T00:00:00Z&pillarId=…
 ```
+
+Takes the same four parameters as `/analytics/overview`.
+
+```json
+{
+  "data": [
+    {
+      "contentPostId": "8f14e45f-ceea-467a-9ba3-1f2b3c4d5e6f",
+      "platform": "X",
+      "contentPillarId": "3b7c1d2e-4a5f-4c6d-8e9f-0a1b2c3d4e5f",
+      "contentPillarName": "AI for Business",
+      "publishedAt": "2026-09-12T09:00:00Z",
+      "recordedAt": "2026-09-12T15:00:00Z",
+      "impressions": 1200,
+      "likes": 84,
+      "comments": 9,
+      "shares": 3,
+      "clicks": 41,
+      "profileVisits": 12,
+      "followersGained": 2,
+      "engagementRate": 8.0
+    }
+  ]
+}
+```
+
+`contentPillarId` and `contentPillarName` are both `null` when the originating
+idea was never attributed to a pillar. `GET /analytics/posts/{id}` returns
+these two fields too.
+
+`recordedAt` is `null` when the post has no metric snapshot at all, which is
+how a caller distinguishes "no data yet" from "zero".
+
+### Ordering
+
+`publishedAt` descending, with `contentPostId` ascending as the tie-break, so
+repeated calls over unchanged data always return the same order.
 
 ---
 
-## GET `/analytics/posts/{publicationId}`
+## GET `/analytics/posts/{contentPostId}`
 
-Returns metrics for a specific publication.
+Returns metrics for a single published post.
+
+```http
+GET /api/v1/analytics/posts/8f14e45f-ceea-467a-9ba3-1f2b3c4d5e6f
+```
+
+The original sketch named this parameter `{publicationId}`. There is no
+publication entity — publishing records its outcome on the content post — so
+the route is keyed by content post id.
+
+Returns `404 ANALYTICS_POST_NOT_FOUND` when the post does not exist, belongs to
+another workspace, **or was never published**. A post that exists but has no
+performance data of its own is still `200` with `null` metrics, because "published
+with no data yet" and "not a published post" are different answers.
+
+---
+
+## Errors
+
+| Code | Status | Cause |
+|---|---|---|
+| `INVALID_ANALYTICS_PERIOD` | 400 | `from` is later than `to` |
+
+---
+
+## Analytics rules that are not in the parameter list
+
+- Only posts whose status is `Published` are counted. Draft, approved, scheduled
+  and rejected posts are invisible here, including a post whose publish failed —
+  a failed publish leaves the status `Scheduled` with a `PublishFailureReason`, so
+  it must not be reported as published.
+- A post may have several metric snapshots, because platform statistics keep
+  moving. Reads use the **latest** `recordedAt`, with the higher `id` as the
+  tie-break when two snapshots share a timestamp.
+- The period filters on `PublishedAt`, not `CreatedAt`. A post is part of a
+  period by when it went out, not by when it was written.
+- Everything is scoped to the caller's workspace. The database enforces this
+  too: `content_post_metrics` references its post by `(WorkspaceId, ContentPostId)`,
+  so a metric row cannot point at another workspace's post even by mistake.
+
+---
+
+## Deferred
+
+- **`pillarId` filter.** Previously omitted because no content pillar entity
+  existed. It is implemented on both `/content/ideas` and `/analytics/overview`
+  and `/analytics/posts`, since `content_pillars` and
+  `content_ideas.ContentPillarId` both exist.
+- **Trend, platform-comparison and pillar-performance breakdowns.** Not built.
+  The `pillarId` filter is a way to *scope* existing totals to one pillar, not
+  a grouped per-pillar comparison.
+- **LinkedIn member post metrics.** Supported in code through
+  `memberCreatorPostAnalytics`, but that endpoint requires LinkedIn's Community
+  Management API product, which is not part of the default connection scopes.
+  Without it the read is rejected and the post's metrics stay `null`.
+- **Live platform verification.** The sync pipeline is covered by unit tests and
+  the conditional database writes are verified against PostgreSQL, but no live
+  LinkedIn or X credentials are available, so real provider responses are
+  unverified.
 
 ---
 
 # 37. Performance Learning
 
+Performance learning is the loop that turns measured performance into something
+a publisher can act on. It has two halves that are deliberately not the same
+thing:
+
+- the **observation** is computed in code from real metric totals, and
+- the **recommendation** is the model's reading of that evidence.
+
+They are stored and returned in separate fields, so a reader can accept one
+without the other and can tell at a glance which half is a measurement.
+
 ## GET `/learning/insights`
 
-Returns AI-generated learning insights from historical content performance.
+Returns the workspace's stored learning signals, newest first.
+
+Query parameters:
+
+- `limit` — optional, default and maximum 200. Signals accumulate, so this is a
+  recent-history read rather than a full history export.
 
 Example:
 
@@ -1636,16 +2097,152 @@ Example:
 {
   "data": [
     {
-      "type": "HookPattern",
-      "insight": "Posts beginning with a specific problem statement have generated stronger discussion.",
-      "evidenceCount": 8,
+      "id": "1f0c2c1e-9a1b-4d4e-8a0b-2f2f0f5b1a44",
+      "type": "PLATFORM_ENGAGEMENT",
+      "dimension": "Platform",
+      "observation": "Across 5 measured posts, Platform LinkedIn averaged 6% engagement over 3 posts, compared with 2% for X over 2 posts.",
+      "recommendation": "Worth trying one more LinkedIn-only post next week before changing anything else.",
+      "evidenceCount": 5,
+      "confidence": 50.0,
       "createdAt": "2026-09-25T18:30:00Z"
     }
-  ]
+  ],
+  "message": "Learning insights retrieved successfully."
 }
 ```
 
-Learning insights should be evidence-based and distinguish observations from recommendations.
+`observation` is written by code from the metric totals and can be recomputed
+from them at any time. `recommendation` is inference. `confidence` is a
+strength-of-evidence indicator from 0 to 100, derived from the size of the
+smaller compared group; it is not a probability and no significance test is
+computed anywhere in this feature.
+
+## POST `/learning/insights`
+
+Runs the loop once over the workspace's measured posts. The run compares the
+posts, asks the model what each difference might mean, and stores one signal per
+finding. There is no request body: the window is the configured lookback, so a
+caller cannot narrow it to a smaller and more flattering sample.
+
+Example:
+
+```json
+{
+  "data": {
+    "from": "2026-06-27T18:30:00Z",
+    "to": "2026-09-25T18:30:00Z",
+    "postsInWindow": 12,
+    "measuredPosts": 9,
+    "minimumMeasuredPosts": 5,
+    "hasSufficientData": true,
+    "insights": [
+      {
+        "id": "1f0c2c1e-9a1b-4d4e-8a0b-2f2f0f5b1a44",
+        "type": "PLATFORM_ENGAGEMENT",
+        "dimension": "Platform",
+        "observation": "Across 5 measured posts, Platform LinkedIn averaged 6% engagement over 3 posts, compared with 2% for X over 2 posts.",
+        "recommendation": "Worth trying one more LinkedIn-only post next week before changing anything else.",
+        "evidenceCount": 5,
+        "confidence": 50.0,
+        "createdAt": "2026-09-25T18:30:00Z"
+      }
+    ]
+  },
+  "message": "Learning insights generated successfully."
+}
+```
+
+### What a run does
+
+1. Reads the workspace's published posts inside the lookback window, each with
+   its current metric snapshot, through the same reader the analytics endpoints
+   use. Posts that were never measured are counted in `postsInWindow` and
+   contribute no evidence.
+2. Groups the measured posts by one dimension at a time — platform, content
+   type, content pillar, and day of week in UTC — and keeps only groups that can
+   support a comparison: at least `MinimumPostsPerGroup` posts, and an
+   engagement rate, which needs impressions.
+3. Reports a difference for a dimension only when the strongest group is at
+   least `MinimumEngagementRateGap` above the weakest. Otherwise the dimension
+   is silent.
+4. Asks the model for one recommendation per finding, and stores the finding.
+
+Hour of day is not analysed. Twenty-four buckets would leave almost every bucket
+holding a single post, which cannot support a comparison at any threshold. Day of
+week is reported in UTC because the audience timezone is not stored anywhere the
+publisher can read it.
+
+### Insufficient data
+
+When there are fewer than `MinimumMeasuredPosts` measured posts, or no dimension
+has two comparable groups, the run completes with `hasSufficientData: false`, an
+empty `insights` array, and a message saying why. No AI call is made and no
+signal is written. This is a successful run that had nothing to say, not an
+error.
+
+```json
+{
+  "data": {
+    "from": "2026-06-27T18:30:00Z",
+    "to": "2026-09-25T18:30:00Z",
+    "postsInWindow": 5,
+    "measuredPosts": 2,
+    "minimumMeasuredPosts": 5,
+    "hasSufficientData": false,
+    "insights": []
+  },
+  "message": "Not enough measured performance to generate learning insights yet."
+}
+```
+
+### Why this runs in the request, not the worker
+
+The run is API-triggered rather than a background poll, and the reason is
+structural rather than a matter of preference:
+
+- a run makes AI calls, and every other AI operation in the system is
+  request-triggered;
+- an AI run row is recorded against the workspace of the request that caused it,
+  and the worker has no request and therefore no workspace to record against.
+
+Adding AI to the worker would mean inventing a workspace-explicit run recorder
+and a background AI configuration, both of which are outside what this loop
+needs. The publisher asking for a run is also the only moment the result is
+wanted. A scheduled run can be added when there is a demonstrated need for
+signals to appear without being asked for.
+
+### Configuration
+
+```json
+{
+  "LearningLoop": {
+    "LookbackDays": 90,
+    "MinimumMeasuredPosts": 5,
+    "MinimumPostsPerGroup": 2,
+    "MinimumEngagementRateGap": 0.25
+  }
+}
+```
+
+Every value exists to make the loop say less. A workspace with two published
+posts has no pattern, only two data points, and a comparison drawn from it would
+read as a finding while being noise.
+
+### Scope notes
+
+- **A run is a series of model calls.** One call per finding, made one at a
+  time. A provider failure fails the run: no partial set of signals is stored
+  against an analysis that was not completed. A workspace with enough measured
+  posts to produce findings needs a configured AI provider.
+- **Correlation, not causation.** Posts differ in many ways at once. The
+  observation says what was measured and never why, and the prompt instructs the
+  model to recommend something to try rather than to assert a cause.
+- **Signals are append-only.** A later run over a longer history is a new
+  observation, not a correction of an earlier one, so repeated runs accumulate
+  rows and none is updated in place.
+- **No live provider verification.** The loop is covered by unit tests and its
+  database behaviour is verified against PostgreSQL, but no live AI provider
+  call has been made, so a real model response is unverified.
 
 ---
 
@@ -1710,9 +2307,13 @@ Example:
     {
       "id": "uuid",
       "action": "ContentApproved",
-      "resourceType": "ContentDraft",
+      "resourceType": "ContentPost",
       "resourceId": "uuid",
       "performedBy": "uuid",
+      "ipAddress": "203.0.113.5",
+      "userAgent": "string",
+      "oldValues": "{\"status\":\"Draft\"}",
+      "newValues": "{\"status\":\"Approved\"}",
       "createdAt": "2026-09-25T18:30:00Z"
     }
   ]
@@ -1720,6 +2321,25 @@ Example:
 ```
 
 Audit logs are read-only through the API.
+
+Notes on the implemented endpoint:
+
+- `resourceType` records the table that was acted on. The example above says
+  `ContentPost` rather than `ContentDraft`, because there is no draft table:
+  drafts and platform variants both live on `content_posts`.
+- `action` values are PascalCase, matching the enum names in
+  `apps/api/Domain/Enums/AuditAction.cs`.
+- `oldValues` and `newValues` are serialized JSON objects, returned as strings
+  because the `audit_logs` columns are `jsonb`.
+- `performedBy` is null for a system-scoped action. This currently applies to
+  `AccountConnected` only: the social OAuth callback is anonymous and resolves
+  its workspace from signed state rather than from a token, so there is no
+  authenticated user to attribute the connect to.
+- Optional query filters: `action`, `resourceType`, and `resourceId`. The last
+  two match the `audit_logs_entity` index.
+- Results are newest first. A single call returns at most 200 rows; the
+  endpoint is not paginated yet, so a workspace with more history than that
+  needs pagination added before the cap can be lifted.
 
 ---
 
@@ -1840,9 +2460,12 @@ PublicationRequested
 PublicationSucceeded
 PublicationFailed
 AnalyticsSyncRequested
-PerformanceAnalysisRequested
-LearningSignalCreated
 ```
+
+`PerformanceAnalysisRequested` and `LearningSignalCreated` are not event types.
+The learning loop is request-triggered, so a run has no job to publish and a
+stored signal has no subscriber to notify. Adding them to this list would
+describe a messaging path the system does not have.
 
 Internal event payloads should contain IDs and necessary metadata rather than large duplicated objects.
 
@@ -1922,6 +2545,41 @@ Social OAuth credentials must:
 - Use secure OAuth state validation
 - Use appropriate redirect URI validation
 - Support token refresh where available
+
+### How this is implemented
+
+Credential encryption uses ASP.NET Core Data Protection through
+`ISocialCredentialProtector`, so the algorithm can be replaced without touching
+callers. Access and refresh tokens are protected under **separate purposes**, so a
+protected access token can never be decrypted as a refresh token or the reverse.
+
+| Purpose string | Protects |
+| --- | --- |
+| `Mayorx.ContentEngine.SocialCredentials.AccessToken.v1` | Access tokens |
+| `Mayorx.ContentEngine.SocialCredentials.RefreshToken.v1` | Refresh tokens |
+
+The `ISocialCredentialProtector` abstraction exists so a different backing store
+can be introduced later without changing the social account service. It is not
+intended as a general-purpose secret store.
+
+Data Protection keys are persisted to a local key ring. **The key ring is as
+sensitive as the credentials it protects**: losing it makes every stored token
+unrecoverable, and leaking it makes every stored token readable.
+
+| Environment | Key ring |
+| --- | --- |
+| Development | `.data-protection-keys/` at the repository root, git-ignored |
+| Production | Must be an explicitly configured, protected, persistent location |
+
+Production must not rely on the default per-machine profile location. Multiple
+API instances must share one key ring, or a token encrypted by one instance will
+be undecryptable by another. A production deployment that cannot provide a
+protected persistent key ring must not enable social connections.
+
+> **Not yet implemented:** rotating or revoking Data Protection keys. There is
+> currently no supported way to re-encrypt existing tokens after a key rotation
+> without reconnecting the affected accounts. Disconnect and reconnect is the
+> recovery path.
 
 ---
 
@@ -2239,11 +2897,14 @@ POST /ai/content/{id}/revise
 ## Social
 
 ```text
-GET    /social/accounts
-GET    /social/{platform}/connect
-GET    /social/{platform}/callback
-DELETE /social/accounts/{id}
+GET    /api/v1/social/accounts
+GET    /api/v1/social/{platform}/connect
+GET    /api/v1/social/{platform}/callback
+DELETE /api/v1/social/accounts/{id}
 ```
+
+Implemented in `SocialAccountsController`. The callback is the only anonymous
+action; every other social action requires authentication.
 
 ## Scheduling & Publishing
 
@@ -2252,18 +2913,19 @@ GET    /schedules
 POST   /schedules
 PATCH  /schedules/{id}
 DELETE /schedules/{id}
-
-GET  /publications
-POST /publications
-GET  /publications/{id}
 ```
+
+Publishing has no endpoints. It runs in the scheduled post worker, and its
+outcome is reported on the content post as `status`, `publishedAt`, and
+`publishFailureReason`. `GET /publications*` is deferred; see
+[Publishing](#35-publishing).
 
 ## Analytics
 
 ```text
 GET /analytics/overview
 GET /analytics/posts
-GET /analytics/posts/{publicationId}
+GET /analytics/posts/{contentPostId}
 ```
 
 ---

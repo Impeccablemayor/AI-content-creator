@@ -251,6 +251,19 @@ Publish
 - Posting preferences
 - Content mix
 
+**Status: content pillars implemented.** The `content_pillars` table and the
+full CRUD surface at `/strategy/pillars` exist, workspace scoped, with a
+name unique per workspace, a `(0, 100]` weight, an optional objective and
+target audience profile, and an active flag. Ideas can be attributed to a
+pillar, which is what makes the pillar filters on `/content/ideas` and
+`/analytics/posts` and `/analytics/overview` possible.
+
+Deleting a pillar keeps the ideas built from it and clears their attribution
+rather than deleting content.
+
+Content goals, posting preferences and content mix remain design intent, as
+does AI-driven pillar *recommendation* below.
+
 ### Content
 
 - Content ideas
@@ -277,6 +290,31 @@ Publish
 - Shares
 - Clicks
 - Engagement rate
+
+**Status: implemented.** The workspace overview and per-post endpoints exist,
+along with the `content_post_metrics` table they read, including the
+`platform` / `from` / `to` / `pillarId` filters and workspace scoping. The
+`AnalyticsSync` worker populates the table through the connected account that
+published each post, so the metrics above are collected rather than permanently
+unavailable.
+
+Fetching a post's metrics needs the id the platform assigned it at publish time,
+so `content_posts.published_external_post_id` is written by the same conditional
+update that marks a post `Published`. Posts published before that column existed
+are never back-filled, because the platform ids cannot be recovered after the
+fact.
+
+X exposes every metric above except per-post follower gain, in one request.
+LinkedIn exposes them through `memberCreatorPostAnalytics`, which requires the
+Community Management API product and is therefore optional per deployment.
+
+The `pillarId` filter was originally omitted because there was no content
+pillar entity to reference. It is now implemented, since `content_pillars` and
+`content_ideas.ContentPillarId` exist.
+
+One documented item is still omitted rather than approximated: the
+`{publicationId}` route parameter, because there is no publication entity —
+the route is keyed by content post id.
 
 ## Outcome
 
@@ -418,6 +456,14 @@ Learning Signal
 Future Recommendations
 ```
 
+The implemented run is `POST /api/v1/learning/insights`. It reads the workspace's
+published posts and their current metric snapshots, groups the measured posts by
+one dimension at a time, and reports a difference only where the strongest group
+clears a configured margin over the weakest. The observation is written by code
+from the real totals; the model is asked only what to try next, and its answer is
+stored beside the measurement rather than merged into it. A run with too little
+measured history returns `hasSufficientData: false` and writes nothing.
+
 ## Learning Signals
 
 Examples:
@@ -429,6 +475,24 @@ Examples:
 - Certain storytelling patterns generate stronger responses
 
 These signals should influence future recommendations.
+
+The first four signal types are implemented, one per compared dimension:
+
+```text
+PLATFORM_ENGAGEMENT
+CONTENT_TYPE_ENGAGEMENT
+CONTENT_PILLAR_ENGAGEMENT
+POSTING_DAY_ENGAGEMENT
+```
+
+Topic, hook, format, and storytelling comparisons are listed here as the target
+vocabulary rather than as delivered behaviour. Each needs text the system does not
+yet measure, and producing one from a proxy would store an inference as though it
+were a finding. They stay unwired until there is a measurement behind them.
+
+Influencing future recommendations is also not done. Signals are stored and
+readable, and nothing yet consumes them; wiring generation to them is a separate
+change with its own risk of a model taking a weak signal as an instruction.
 
 ## User Feedback Learning
 
@@ -799,6 +863,9 @@ Show:
 - Clicks
 - Engagement rate
 
+**Reporting stage delivered.** The read surface and the ingestion that fills it
+are both in place. See "Basic Analytics" above for the per-platform coverage.
+
 ---
 
 ## Stage 2 — Performance Analysis
@@ -941,6 +1008,23 @@ Security requirements should increase alongside product capabilities.
 - Rate limiting
 - Audit logs
 - Secure secrets
+
+### Audit log status
+
+Basic audit logging is implemented. Seven user-initiated actions are recorded
+in the same transaction as the change they describe: idea approve and reject,
+post approve, reject and schedule, and social account connect and disconnect.
+The log is readable at `GET /api/v1/audit-logs`, scoped to the caller's
+workspace, and has no write path.
+
+Not yet recorded, because no code path produces them: `ContentDeleted` and
+`ScheduleCancelled` (no delete or unschedule endpoint exists), and `Published`
+(the background worker does not write audit rows, because doing so would mean
+modifying Publishing).
+
+The endpoint is not paginated and caps a single response at 200 rows, so
+"More detailed audit trails" below is not yet reachable for a workspace with
+long history.
 
 ## Future
 
@@ -1122,6 +1206,29 @@ Deliver:
 - Content editing
 - AI run tracking
 
+### AI run tracking status
+
+AI run tracking is implemented for the three AI operations that exist today:
+idea generation, content generation, and quality evaluation. Each records one
+`ai_runs` row per attempt with the provider, model, prompt version, status,
+duration, timestamps, and operation-specific metadata, scoped to the calling
+workspace. Failures record the exception type rather than its message, because a
+provider exception can quote the prompt or the raw response back.
+
+`InputTokens`, `OutputTokens`, `TotalTokens` and `EstimatedCost` are always
+null. The provider abstraction returns only the generated text, so there is no
+measured usage to record, and a guess written to a cost column reads back later
+as though it had been measured. They become meaningful when the provider
+abstraction exposes reported usage.
+
+Recording is diagnostic and cannot fail the operation it describes: a run row
+that cannot be written is logged and dropped, and the row is detached from the
+change tracker so a later save does not retry it. The remaining eight run types
+in the schema are declared but unwritten, because no code path produces them.
+
+There is no read endpoint. The table is recorded for the cost picture the schema
+calls for, and is not yet surfaced in the API.
+
 ---
 
 ## Stage 3 — Publishing
@@ -1147,6 +1254,17 @@ Deliver:
 - Performance analysis
 - Initial learning signals
 - Content performance dashboard
+
+Status: the first four are delivered. Analytics and metrics give the raw
+measurement, performance analysis compares it, and learning signals store the
+result and can be read back.
+
+The dashboard is not built, and is deliberately not the same thing as the rest of
+this stage. A dashboard is a display decision — which panels, which ranges, whose
+workspace, and what happens when a number is missing — and none of it was needed
+to prove the loop works. What exists instead is two endpoints: one that reads
+stored signals, and one that runs the analysis. A dashboard can be built on top
+of them without changing the loop.
 
 ---
 
