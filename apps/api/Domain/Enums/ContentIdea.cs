@@ -8,6 +8,12 @@ public sealed class ContentIdea
 
     public Guid WorkspaceId { get; set; }
 
+    /// <summary>
+    /// The pillar this idea belongs to, when it has been attributed to one.
+    /// Deleting a pillar clears this rather than deleting the idea.
+    /// </summary>
+    public Guid? ContentPillarId { get; set; }
+
     public ContentIdeaStatus Status { get; set; }
         = ContentIdeaStatus.Suggested;
 
@@ -43,4 +49,6 @@ public sealed class ContentIdea
         = new List<ContentPost>();
 
     public Workspace Workspace { get; set; } = null!;
+
+    public ContentPillar? ContentPillar { get; set; }
 }

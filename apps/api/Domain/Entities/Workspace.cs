@@ -19,6 +19,12 @@ public sealed class Workspace
     public ICollection<ContentIdea> ContentIdeas { get; set; }
     = new List<ContentIdea>();
 
+    public ICollection<SocialAccount> SocialAccounts { get; set; }
+    = new List<SocialAccount>();
+
+    public ICollection<ContentPillar> ContentPillars { get; set; }
+    = new List<ContentPillar>();
+
     public ContentStrategy? ContentStrategy { get; set; }
     public BrandProfile? BrandProfile { get; set; }
 
