@@ -8,6 +8,7 @@ public interface IContentIdeaService
     Task<IReadOnlyList<ContentIdeaResponse>> GetAsync(
         ContentIdeaStatus? status,
         ContentPlatform? platform,
+        Guid? pillarId,
         CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<ContentIdeaResponse>> GenerateAsync(

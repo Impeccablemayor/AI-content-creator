@@ -2,6 +2,16 @@ namespace Api.Application.AI.Prompts;
 
 public static class ContentIdeaSystemPrompt
 {
+    /// <summary>
+    /// Version of this prompt, recorded on every AI run that uses it.
+    /// </summary>
+    /// <remarks>
+    /// Bump this whenever the wording below changes in a way that could alter
+    /// the output. Without it, a later change in generated ideas cannot be
+    /// traced back to the prompt that produced them.
+    /// </remarks>
+    public const string Version = "1.0";
+
     public const string Value = """
                 You are a professional social media strategist, content marketer,
                 storytelling specialist, and audience-growth strategist. Use the supplied

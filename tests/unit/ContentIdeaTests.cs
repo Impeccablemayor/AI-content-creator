@@ -112,6 +112,63 @@ public sealed class ContentIdeaTests
     }
 
     [Fact]
+    public async Task Listing_can_be_filtered_to_a_single_pillar()
+    {
+        var workspaceId = Guid.NewGuid();
+        await using var dbContext = CreateDbContext();
+        var pillarId = Guid.NewGuid();
+
+        var education = CreateIdea(workspaceId, 90m);
+        education.ContentPillarId = pillarId;
+        var unattributed = CreateIdea(workspaceId, 80m);
+        dbContext.ContentIdeas.AddRange(education, unattributed);
+        await dbContext.SaveChangesAsync();
+
+        var ideas = await CreateService(dbContext, workspaceId).GetAsync(null, null, pillarId);
+
+        Assert.Equal(education.Id, Assert.Single(ideas).Id);
+    }
+
+    [Fact]
+    public async Task Listing_with_another_workspaces_pillar_returns_nothing()
+    {
+        var workspaceId = Guid.NewGuid();
+        var otherWorkspaceId = Guid.NewGuid();
+        await using var dbContext = CreateDbContext();
+        var foreignPillarId = Guid.NewGuid();
+
+        // The idea and its pillar both belong to a different workspace, so
+        // filtering on that pillar from this workspace must not surface it.
+        var foreignIdea = CreateIdea(otherWorkspaceId, 90m);
+        foreignIdea.ContentPillarId = foreignPillarId;
+        var ownedIdea = CreateIdea(workspaceId, 80m);
+        dbContext.ContentIdeas.AddRange(foreignIdea, ownedIdea);
+        await dbContext.SaveChangesAsync();
+
+        var ideas = await CreateService(dbContext, workspaceId)
+            .GetAsync(null, null, foreignPillarId);
+
+        Assert.Empty(ideas);
+    }
+
+    [Fact]
+    public async Task Listing_reports_which_pillar_an_idea_belongs_to()
+    {
+        var workspaceId = Guid.NewGuid();
+        await using var dbContext = CreateDbContext();
+        var pillarId = Guid.NewGuid();
+
+        var idea = CreateIdea(workspaceId, 90m);
+        idea.ContentPillarId = pillarId;
+        dbContext.ContentIdeas.Add(idea);
+        await dbContext.SaveChangesAsync();
+
+        var result = await CreateService(dbContext, workspaceId).GetAsync(null, null, null);
+
+        Assert.Equal(pillarId, Assert.Single(result).ContentPillarId);
+    }
+
+    [Fact]
     public async Task Listing_and_approval_are_restricted_to_current_workspace()
     {
         var workspaceId = Guid.NewGuid();
@@ -123,7 +180,7 @@ public sealed class ContentIdeaTests
         await dbContext.SaveChangesAsync();
 
         var service = CreateService(dbContext, workspaceId);
-        var ideas = await service.GetAsync(null, null);
+        var ideas = await service.GetAsync(null, null, null);
         var foreignApproval = await service.ApproveAsync(otherIdea.Id);
         var ownedApproval = await service.ApproveAsync(ownedIdea.Id);
 
@@ -252,7 +309,9 @@ public sealed class ContentIdeaTests
         return new ContentIdeaService(
             dbContext,
             new CurrentUserService(accessor),
+            AuditLogTestContext.Create(dbContext, accessor),
             aiProvider ?? new StubAiProvider("{}"),
+            AiRunTestContext.Create(dbContext, workspaceId),
             new ContentIdeaPromptBuilder());
     }
 

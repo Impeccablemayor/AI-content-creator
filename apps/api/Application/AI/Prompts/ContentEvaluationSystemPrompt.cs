@@ -2,6 +2,16 @@ namespace Api.Application.AI.Prompts;
 
 public static class ContentEvaluationSystemPrompt
 {
+    /// <summary>
+    /// Version of this prompt, recorded on every AI run that uses it.
+    /// </summary>
+    /// <remarks>
+    /// Bump this whenever the wording below changes in a way that could alter
+    /// the scores. Evaluation scores feed accept/reject decisions, so an
+    /// unversioned change here would be hard to explain after the fact.
+    /// </remarks>
+    public const string Version = "1.0";
+
     public const string Value = """
         You are evaluating one already-written social media post against the supplied brand, audience, strategy, idea, and platform context. You are a rigorous content quality reviewer, not a writer and not a fan of the draft.
 

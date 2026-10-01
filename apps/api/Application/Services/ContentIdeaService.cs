@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Api.Application.AI;
+using Api.Application.AuditLogs;
 using Api.Application.AI.Models;
 using Api.Application.AI.Prompts;
 using Api.Application.Authentication;
@@ -20,24 +22,31 @@ public sealed class ContentIdeaService : IContentIdeaService
 
     private readonly AppDbContext _dbContext;
     private readonly CurrentUserService _currentUser;
+    private readonly IAuditLogService _auditLog;
     private readonly IAiProvider _aiProvider;
+    private readonly IAiRunRecorder _aiRunRecorder;
     private readonly ContentIdeaPromptBuilder _promptBuilder;
 
     public ContentIdeaService(
         AppDbContext dbContext,
         CurrentUserService currentUser,
+        IAuditLogService auditLog,
         IAiProvider aiProvider,
+        IAiRunRecorder aiRunRecorder,
         ContentIdeaPromptBuilder promptBuilder)
     {
         _dbContext = dbContext;
         _currentUser = currentUser;
+        _auditLog = auditLog;
         _aiProvider = aiProvider;
+        _aiRunRecorder = aiRunRecorder;
         _promptBuilder = promptBuilder;
     }
 
     public async Task<IReadOnlyList<ContentIdeaResponse>> GetAsync(
         ContentIdeaStatus? status,
         ContentPlatform? platform,
+        Guid? pillarId,
         CancellationToken cancellationToken = default)
     {
         var query = _dbContext.ContentIdeas
@@ -52,6 +61,13 @@ public sealed class ContentIdeaService : IContentIdeaService
         if (platform.HasValue)
         {
             query = query.Where(idea => idea.Platform == platform.Value);
+        }
+
+        if (pillarId.HasValue)
+        {
+            // Scoped to the caller's workspace by the predicate above, so a
+            // pillar from another workspace simply matches nothing.
+            query = query.Where(idea => idea.ContentPillarId == pillarId.Value);
         }
 
         var ideas = await query
@@ -106,27 +122,62 @@ public sealed class ContentIdeaService : IContentIdeaService
             request.TopicHint,
             DateTimeOffset.UtcNow);
 
-        var generatedJson = await _aiProvider.GenerateAsync(
-            ContentIdeaSystemPrompt.Value,
-            prompt,
-            ContentIdeaResponseSchema.Value,
-            cancellationToken);
-
-        ContentIdeaGenerationResult? generated;
+        var runStartedAt = Stopwatch.GetTimestamp();
+        object runMetadata;
+        IReadOnlyList<GeneratedContentIdea> validatedIdeas;
         try
         {
-            generated = JsonSerializer.Deserialize<ContentIdeaGenerationResult>(
-                generatedJson,
-                JsonOptions);
+            var generatedJson = await _aiProvider.GenerateAsync(
+                ContentIdeaSystemPrompt.Value,
+                prompt,
+                ContentIdeaResponseSchema.Value,
+                cancellationToken);
+
+            ContentIdeaGenerationResult? generated;
+            try
+            {
+                generated = JsonSerializer.Deserialize<ContentIdeaGenerationResult>(
+                    generatedJson,
+                    JsonOptions);
+            }
+            catch (JsonException)
+            {
+                throw new InvalidAiResponseException(
+                    "The AI response was not valid structured JSON.");
+            }
+
+            runMetadata = new
+            {
+                platform = request.Platform.ToString(),
+                requestedCount = request.Count
+            };
+
+            validatedIdeas = ContentIdeaGenerationValidator
+                .ValidateAndNormalize(generated, request.Count);
         }
-        catch (JsonException)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            throw new InvalidAiResponseException(
-                "The AI response was not valid structured JSON.");
+            await _aiRunRecorder.RecordFailureAsync(
+                AIRunType.IdeaGeneration,
+                ContentIdeaSystemPrompt.Version,
+                Stopwatch.GetElapsedTime(runStartedAt),
+                exception,
+                new
+                {
+                    platform = request.Platform.ToString(),
+                    requestedCount = request.Count
+                },
+                cancellationToken);
+            throw;
         }
 
-        var validatedIdeas = ContentIdeaGenerationValidator
-            .ValidateAndNormalize(generated, request.Count);
+        await _aiRunRecorder.RecordSuccessAsync(
+            AIRunType.IdeaGeneration,
+            ContentIdeaSystemPrompt.Version,
+            Stopwatch.GetElapsedTime(runStartedAt),
+            runMetadata,
+            cancellationToken);
+
         var now = DateTime.UtcNow;
         var entities = validatedIdeas.Select(idea => new ContentIdea
         {
@@ -160,16 +211,25 @@ public sealed class ContentIdeaService : IContentIdeaService
     public Task<ContentIdeaResponse?> ApproveAsync(
         Guid id,
         CancellationToken cancellationToken = default) =>
-        UpdateStatusAsync(id, ContentIdeaStatus.Approved, cancellationToken);
+        UpdateStatusAsync(
+            id,
+            ContentIdeaStatus.Approved,
+            AuditAction.ContentApproved,
+            cancellationToken);
 
     public Task<ContentIdeaResponse?> RejectAsync(
         Guid id,
         CancellationToken cancellationToken = default) =>
-        UpdateStatusAsync(id, ContentIdeaStatus.Rejected, cancellationToken);
+        UpdateStatusAsync(
+            id,
+            ContentIdeaStatus.Rejected,
+            AuditAction.ContentRejected,
+            cancellationToken);
 
     private async Task<ContentIdeaResponse?> UpdateStatusAsync(
         Guid id,
         ContentIdeaStatus newStatus,
+        AuditAction auditAction,
         CancellationToken cancellationToken)
     {
         var idea = await _dbContext.ContentIdeas.FirstOrDefaultAsync(
@@ -187,8 +247,20 @@ public sealed class ContentIdeaService : IContentIdeaService
             throw new InvalidContentIdeaTransitionException();
         }
 
+        var previous = idea.Status;
+
         idea.Status = newStatus;
         idea.UpdatedAt = DateTime.UtcNow;
+
+        // Queued, not saved: written by the same SaveChanges as the change.
+        await _auditLog.RecordAsync(
+            auditAction,
+            "ContentIdea",
+            idea.Id,
+            new { status = previous.ToString() },
+            new { status = newStatus.ToString() },
+            cancellationToken);
+
         await _dbContext.SaveChangesAsync(cancellationToken);
 
         return Map(idea);
@@ -199,6 +271,7 @@ public sealed class ContentIdeaService : IContentIdeaService
         Id = idea.Id,
         Status = idea.Status.ToString(),
         Platform = idea.Platform.ToString(),
+        ContentPillarId = idea.ContentPillarId,
         Title = idea.Title,
         Topic = idea.Topic,
         Angle = idea.Angle,

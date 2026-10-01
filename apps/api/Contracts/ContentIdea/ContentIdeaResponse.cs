@@ -10,6 +10,11 @@ public sealed class ContentIdeaResponse
 
     public string Platform { get; init; } = string.Empty;
 
+    /// <summary>
+    /// The pillar this idea is attributed to, when it has one.
+    /// </summary>
+    public Guid? ContentPillarId { get; init; }
+
     public string Title { get; init; } = string.Empty;
 
     public string Topic { get; init; } = string.Empty;

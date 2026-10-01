@@ -29,11 +29,13 @@ public sealed class ContentIdeasController : ControllerBase
     public async Task<IActionResult> Get(
         [FromQuery] ContentIdeaStatus? status,
         [FromQuery] ContentPlatform? platform,
+        [FromQuery] Guid? pillarId,
         CancellationToken cancellationToken)
     {
         var response = (await _contentIdeaService.GetAsync(
             status,
             platform,
+            pillarId,
             cancellationToken)).ToList();
 
         return Ok(new ApiResponse<List<ContentIdeaResponse>>
