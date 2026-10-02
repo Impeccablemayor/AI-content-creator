@@ -7,6 +7,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The label helpers and the metrics collector's renderer are internal on
+         purpose: they are the application's own details, not a public surface.
+         The unit tests read them directly rather than through a seam that exists
+         only to be called from a test. -->
+    <InternalsVisibleTo Include="api.tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
     <PackageReference Include="DotNetEnv" Version="3.2.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.12" />

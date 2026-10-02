@@ -88,7 +88,9 @@ public abstract class OAuthSocialPlatformProvider : ISocialPlatformProvider
         using var response = await _client.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            throw CreateProviderFailure(response.StatusCode, "the OAuth token endpoint");
+            throw CreateProviderFailure(
+                response.StatusCode,
+                SocialProviderOperation.OAuthToken);
         }
 
         await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -151,26 +153,44 @@ public abstract class OAuthSocialPlatformProvider : ISocialPlatformProvider
         using var response = await _client.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            throw CreateProviderFailure(response.StatusCode, "the platform profile endpoint");
+            throw CreateProviderFailure(
+                response.StatusCode,
+                SocialProviderOperation.OAuthProfile);
         }
 
         var body = await response.Content.ReadAsStreamAsync(cancellationToken);
         return await JsonDocument.ParseAsync(body, cancellationToken: cancellationToken);
     }
 
-    private static Exception CreateProviderFailure(
+    private Exception CreateProviderFailure(
         HttpStatusCode statusCode,
-        string endpointDescription)
+        SocialProviderOperation operation)
     {
+        // Counted here, next to the classification, because this is the only place
+        // an OAuth failure is described. The classification below is narrower than
+        // the publishing one on purpose: an OAuth failure is always a problem with
+        // the stored configuration, so only the provider's own answer is reported.
+        Infrastructure.Metrics.ApplicationMetrics.RecordProviderFailure(
+            Platform,
+            operation,
+            statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                ? SocialProviderFailureClass.Authentication
+                : SocialProviderFailureClass.Request);
+
         return statusCode switch
         {
             HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden =>
                 new SocialProviderAuthenticationException(
-                    $"The social platform rejected the configured credentials when calling {endpointDescription}."),
+                    $"The social platform rejected the configured credentials when calling {Describe(operation)}."),
             _ => new SocialProviderRequestException(
-                $"The social platform returned HTTP {(int)statusCode} from {endpointDescription}.")
+                $"The social platform returned HTTP {(int)statusCode} from {Describe(operation)}.")
         };
     }
+
+    private static string Describe(SocialProviderOperation operation) =>
+        operation == SocialProviderOperation.OAuthToken
+            ? "the OAuth token endpoint"
+            : "the platform profile endpoint";
 
     protected static string? ReadString(JsonElement element, string propertyName)
     {

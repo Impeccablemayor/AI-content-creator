@@ -1,5 +1,6 @@
 using Api.Application.Publishing;
 using Api.Configuration;
+using Api.Infrastructure.Metrics;
 using Microsoft.Extensions.Options;
 
 namespace Api.Application.Scheduling;
@@ -18,6 +19,12 @@ public sealed class ScheduledPostProcessor(
             TimeSpan.FromMinutes(_options.ClaimExpiryMinutes));
 
         var due = await store.FindDueAsync(now, _options.BatchSize, cancellationToken);
+
+        // Recorded before the early return, because an idle scan is the normal
+        // case and a histogram of it is what shows a backlog building up before
+        // any post is late.
+        ApplicationMetrics.RecordScheduledPostScan(due.Count);
+
         if (due.Count == 0)
         {
             logger.LogDebug("No due scheduled content posts found.");
@@ -87,6 +94,11 @@ public sealed class ScheduledPostProcessor(
                         throw new InvalidOperationException(
                             $"Unhandled publish outcome {result.Outcome}.");
                 }
+
+                ApplicationMetrics.RecordPublishAttempt(
+                    candidate.Platform,
+                    result.Outcome,
+                    result.FailureReason);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -102,6 +114,14 @@ public sealed class ScheduledPostProcessor(
                     "retried when its claim expires.",
                     candidate.ContentPostId,
                     candidate.WorkspaceId);
+
+                // Counted with no reason because there is none to give: this is the
+                // attempt failing in a way the publish service does not describe,
+                // and the log above is where the exception itself is recorded.
+                ApplicationMetrics.RecordPublishAttempt(
+                    candidate.Platform,
+                    PublishOutcome.Failed,
+                    reason: null);
             }
         }
 

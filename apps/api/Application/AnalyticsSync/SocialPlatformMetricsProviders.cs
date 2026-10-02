@@ -73,7 +73,8 @@ public abstract class OAuthSocialPlatformMetricsProvider : ISocialPlatformMetric
         {
             throw SocialProviderHttpFailures.FromStatusCode(
                 response.StatusCode,
-                $"reading {Platform} post metrics");
+                SocialProviderOperation.Metrics,
+                Platform);
         }
 
         try

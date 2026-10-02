@@ -182,18 +182,52 @@ Build the underlying platform architecture required for the product.
 
 ### Health and observability status
 
-The observability foundation listed above is built; the monitoring stack around it is
-not.
+The observability foundation and the metrics collection and export around it are
+built. Distributed tracing, error tracking and a worker HTTP listener are not, and
+are out of scope for this milestone.
 
 | Capability | Status |
 | --- | --- |
 | `GET /api/v1/health` | Implemented. Checks PostgreSQL, Redis, and AI provider configuration, and answers `503` when a dependency is down |
 | `GET /api/v1/health/live` | Implemented. Runs no dependency check, so an outage does not trigger a restart loop |
 | `X-Correlation-Id` | Implemented. Accepted or generated, echoed on the response, and applied to tracing and a logging scope |
-| Metrics collection and export | Not implemented |
+| Metrics collection and export | Implemented. `System.Diagnostics.Metrics` through one `Mayorx.ContentEngine` meter, rendered as Prometheus text at `GET /api/v1/metrics` |
 | Distributed trace export | Not implemented |
 | Error tracking service | Not implemented |
 | Worker health endpoint | Not implemented, the worker runs no HTTP listener |
+| Dashboards and alerts | Not implemented, the scrape is the deliverable and a monitoring backend is a deployment decision |
+
+### Metrics, as implemented
+
+| Instrument | Type | Labels |
+| --- | --- | --- |
+| `mayorx_http_server_requests_total` | counter | `method`, `status_class`, `route` |
+| `mayorx_http_server_request_duration_seconds` | histogram | `method`, `status_class`, `route` |
+| `mayorx_ai_operations_total` | counter | `provider`, `run_type`, `outcome` |
+| `mayorx_ai_operation_duration_seconds` | histogram | `provider`, `run_type` |
+| `mayorx_publish_attempts_total` | counter | `platform`, `outcome`, `reason` |
+| `mayorx_analytics_sync_attempts_total` | counter | `outcome`, `reason` |
+| `mayorx_external_provider_failures_total` | counter | `platform`, `operation`, `failure_class` |
+| `mayorx_worker_poll_runs_total` | counter | `operation`, `outcome` |
+| `mayorx_scheduled_post_scan_due_posts` | histogram | none |
+
+Every label value is bounded by construction: an enum, a deployment setting, or an
+endpoint route template from the routing table. No workspace id, content post id,
+path, query string, prompt or exception message can reach the scrape, because no
+recording function accepts one. `provider` comes from configuration and collapses to
+`other` if it does not fit, and `route` collapses to `other` beyond 128 characters.
+
+Three things are deliberately absent. There is no token or cost series, because the
+AI provider interface returns generated text only and there is no measured usage to
+report. There is no queue-depth series, because nothing in the codebase holds a queue
+whose length can be read. And the worker records its instruments into the same
+process-wide meter while it has no HTTP listener of its own, so the worker's series
+are only exposed if the scrape endpoint is later added to the worker host.
+
+`Metrics:Enabled` defaults to `true`. Setting it to `false` removes both the route
+and the listener behind it, so nothing is collected for an endpoint nobody reads.
+The endpoint is anonymous and excluded from the OpenAPI document: a scraper has no
+JWT, and an advertised anonymous route invites a client that expects authentication.
 
 The reliability of that foundation is now partly proven rather than asserted. A
 dedicated integration test project runs the real composition root against the

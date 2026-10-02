@@ -1,6 +1,7 @@
 using Api.Configuration;
 using Api.Configuration.Swagger;
 using Api.Infrastructure.Health;
+using Api.Infrastructure.Metrics;
 using Api.Infrastructure.Persistence;
 using Api.Middleware;
 using Microsoft.EntityFrameworkCore;
@@ -270,6 +271,29 @@ builder.Services.AddCors(options =>
     });
 });
 
+// Metrics are read at startup, alongside the other settings that decide what the
+// API serves rather than only how it behaves. Disabled means the route and the
+// listener behind it are both absent, so nothing is collected for an endpoint
+// nobody reads.
+//
+// No ValidateOnStart here: a boolean has no invalid state to fail fast on.
+builder.Services
+    .AddOptions<MetricsOptions>()
+    .Bind(builder.Configuration.GetSection(MetricsOptions.SectionName));
+
+var metricsEnabled = builder.Configuration
+    .GetSection(MetricsOptions.SectionName)
+    .Get<MetricsOptions>()?
+    .Enabled
+    ?? new MetricsOptions().Enabled;
+
+if (metricsEnabled)
+{
+    // Singleton: one listener holds the process totals for the lifetime of the
+    // process, and every scrape reads the same snapshot.
+    builder.Services.AddSingleton<PrometheusMetricsCollector>();
+}
+
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<CurrentUserService>();
 builder.Services.AddScoped<JwtTokenService>();
@@ -340,6 +364,12 @@ if (aiOptions.Provider.Equals("Unavailable", StringComparison.OrdinalIgnoreCase)
 // logs and reports under one identifier.
 app.UseMiddleware<CorrelationIdMiddleware>();
 
+// Counts and times every request. It runs immediately after correlation and
+// outside the exception handler, so nothing can short-circuit past it and a
+// request that ended in an exception is counted with the status that was
+// returned.
+app.UseMiddleware<HttpMetricsMiddleware>();
+
 // Oversized bodies are refused before anything reads them. The ceiling itself is
 // read by the middleware from RequestSizeLimit:MaxRequestBodySizeInBytes.
 app.UseMiddleware<RequestSizeLimitMiddleware>();
@@ -365,6 +395,11 @@ app.UseCors(CorsPolicyName);
 app.UseMiddleware<RateLimitingMiddleware>();
 
 app.UseAuthentication();
+
+// The request log runs after authentication so the caller is known, and before
+// authorization so a rejected request is still logged.
+app.UseMiddleware<RequestLoggingMiddleware>();
+
 app.UseAuthorization();
 
 // Liveness answers only whether this process can serve a request. It runs no
@@ -384,6 +419,22 @@ app.MapHealthChecks("/api/v1/health", new HealthCheckOptions
     Predicate = check => check.Tags.Contains("ready"),
     ResponseWriter = HealthResponseWriter.WriteAsync
 });
+
+// The scrape endpoint. Anonymous on purpose: a scraper is not a workspace caller
+// and holds no token. Excluded from the OpenAPI document because it is not part
+// of the API a client integrates against.
+if (metricsEnabled)
+{
+    // Resolved once here, while the host is still being built, rather than left to
+    // be created by the first scrape. A listener only sees measurements made after
+    // it starts, so a collector created on the first request would report a process
+    // that had handled nothing: every request before it, and every AI run and
+    // background scan since startup, would be missing from the first scrape.
+    _ = app.Services.GetRequiredService<PrometheusMetricsCollector>();
+
+    app.MapGet(MetricsScrapeEndpoint.Route, MetricsScrapeEndpoint.WriteAsync)
+        .ExcludeFromDescription();
+}
 
 app.MapControllers();
 

@@ -1,4 +1,5 @@
 using Api.Configuration;
+using Api.Infrastructure.Metrics;
 using Microsoft.Extensions.Options;
 
 namespace Api.Application.AnalyticsSync;
@@ -61,6 +62,10 @@ public sealed class AnalyticsSyncProcessor(
                         throw new InvalidOperationException(
                             $"Unhandled metrics sync outcome {result.Outcome}.");
                 }
+
+                ApplicationMetrics.RecordAnalyticsSyncAttempt(
+                    result.Outcome,
+                    result.FailureReason);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -76,6 +81,12 @@ public sealed class AnalyticsSyncProcessor(
                     "retried after the next resync interval.",
                     candidate.ContentPostId,
                     candidate.WorkspaceId);
+
+                // Counted with no reason because the sync service never described
+                // this one. The log above carries the exception.
+                ApplicationMetrics.RecordAnalyticsSyncAttempt(
+                    MetricsSyncOutcome.Failed,
+                    reason: null);
             }
         }
 

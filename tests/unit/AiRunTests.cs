@@ -19,6 +19,7 @@ using Xunit;
 
 namespace Api.Tests;
 
+[Collection(ApplicationMetricsCollection.Name)]
 public sealed class AiRunTests
 {
     private const string ValidIdeaResponse = """
@@ -551,6 +552,128 @@ public sealed class AiRunTests
             Assert.Equal(runType, AIRunTypeStorage.FromStorage(stored));
         }
     }
+
+    [Fact]
+    public async Task A_succeeded_run_is_counted_as_a_succeeded_ai_operation()
+    {
+        await using var dbContext = CreateDbContext();
+        var workspaceId = await SeedGenerationContextAsync(dbContext);
+        var service = CreateIdeaService(
+            dbContext,
+            workspaceId,
+            new StubAiProvider(ValidIdeaResponse));
+
+        var before = AiOperationCount("succeeded");
+        var durationBefore = AiDurationCount();
+
+        await service.GenerateAsync(new GenerateContentIdeasRequest
+        {
+            Platform = ContentPlatform.LinkedIn,
+            Count = 1
+        });
+
+        Assert.Equal(before + 1, AiOperationCount("succeeded"));
+        Assert.Equal(durationBefore + 1, AiDurationCount());
+    }
+
+    [Fact]
+    public async Task A_failed_run_is_counted_as_a_failed_ai_operation()
+    {
+        // An operation that failed is the one worth counting. A metric that only
+        // counted successes would make an outage look like a quiet day.
+        await using var dbContext = CreateDbContext();
+        var workspaceId = await SeedGenerationContextAsync(dbContext);
+        var service = CreateIdeaService(
+            dbContext,
+            workspaceId,
+            new ThrowingAiProvider(new InvalidAiResponseException("bad")));
+
+        var before = AiOperationCount("failed");
+
+        await Assert.ThrowsAsync<InvalidAiResponseException>(() =>
+            service.GenerateAsync(new GenerateContentIdeasRequest
+            {
+                Platform = ContentPlatform.LinkedIn,
+                Count = 1
+            }));
+
+        Assert.Equal(before + 1, AiOperationCount("failed"));
+    }
+
+    [Fact]
+    public async Task A_run_that_cannot_be_written_is_still_counted()
+    {
+        // The metric is recorded before the row is written. Telemetry that
+        // depended on the database would go missing exactly when the database is
+        // the thing that is broken.
+        var databaseName = Guid.NewGuid().ToString();
+        await using var dbContext = CreateDbContext(databaseName);
+        var workspaceId = await SeedGenerationContextAsync(dbContext);
+
+        var recordingContext = CreateDbContext(
+            databaseName,
+            new IInterceptor[] { new ThrowingSaveChangesInterceptor() });
+        var service = CreateIdeaService(
+            dbContext,
+            workspaceId,
+            new StubAiProvider(ValidIdeaResponse),
+            CreateRunRecorder(recordingContext, workspaceId));
+
+        var before = AiOperationCount("succeeded");
+
+        await service.GenerateAsync(new GenerateContentIdeasRequest
+        {
+            Platform = ContentPlatform.LinkedIn,
+            Count = 1
+        });
+
+        Assert.Equal(before + 1, AiOperationCount("succeeded"));
+    }
+
+    [Fact]
+    public async Task An_ai_metric_never_carries_the_prompt_or_the_response()
+    {
+        // The provider response is generated content. It has no place in a metric
+        // label, and there is no label here that could hold it.
+        await using var dbContext = CreateDbContext();
+        var workspaceId = await SeedGenerationContextAsync(dbContext);
+        var service = CreateIdeaService(
+            dbContext,
+            workspaceId,
+            new StubAiProvider(ValidIdeaResponse));
+
+        await service.GenerateAsync(new GenerateContentIdeasRequest
+        {
+            Platform = ContentPlatform.LinkedIn,
+            Count = 1
+        });
+
+        var series = MetricsScrape.Series("mayorx_ai_operations_total");
+
+        Assert.All(series, sample => Assert.Equal(
+            ["outcome", "provider", "run_type"],
+            sample.Labels.Select(label => label.Key).OrderBy(key => key, StringComparer.Ordinal)));
+        Assert.All(series, sample => Assert.All(
+            sample.Labels,
+            label => Assert.DoesNotContain("A useful idea", label.Value, StringComparison.Ordinal)));
+    }
+
+    /// <summary>
+    /// Deltas rather than exact values: the instruments are process-wide, and this
+    /// class shares its provider label with every other AI test in the run.
+    /// </summary>
+    private static long AiOperationCount(string outcome) =>
+        MetricsScrape.CounterOrZero(
+            "mayorx_ai_operations_total",
+            ("provider", TestAiOptions().Provider),
+            ("run_type", "idea_generation"),
+            ("outcome", outcome));
+
+    private static long AiDurationCount() =>
+        MetricsScrape.HistogramCountOrZero(
+            "mayorx_ai_operation_duration_seconds",
+            ("provider", TestAiOptions().Provider),
+            ("run_type", "idea_generation"));
 
     [Fact]
     public void Run_statuses_round_trip_through_their_stored_strings()

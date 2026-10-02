@@ -7,6 +7,7 @@ using Xunit;
 
 namespace Api.Tests;
 
+[Collection(ApplicationMetricsCollection.Name)]
 public sealed class AnalyticsSyncProcessorTests
 {
     [Fact]
@@ -113,6 +114,90 @@ public sealed class AnalyticsSyncProcessorTests
             processor.RunOnceAsync(cancellation.Token));
     }
 
+    [Fact]
+    public async Task A_successful_sync_is_counted()
+    {
+        var store = new FakeAnalyticsSyncStore { Candidates = [Candidate()] };
+        var processor = CreateProcessor(store, new CountingSyncService());
+
+        var before = SyncAttemptCount("synced", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 1, SyncAttemptCount("synced", "none"));
+    }
+
+    [Fact]
+    public async Task A_failed_sync_is_counted_with_its_reason()
+    {
+        // A revoked credential and a provider outage both fail, and they are not
+        // the same incident.
+        var store = new FakeAnalyticsSyncStore { Candidates = [Candidate()] };
+        var service = new CountingSyncService();
+        service.Outcomes.Enqueue(MetricsSyncOutcome.Failed);
+        service.Reasons.Enqueue(MetricsSyncFailureReason.CredentialsExpired);
+        var processor = CreateProcessor(store, service);
+
+        var before = SyncAttemptCount("failed", "credentials_expired");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 1, SyncAttemptCount("failed", "credentials_expired"));
+    }
+
+    [Fact]
+    public async Task A_sync_that_threw_is_counted_as_a_failure_without_a_reason()
+    {
+        var store = new FakeAnalyticsSyncStore { Candidates = [Candidate()] };
+        var processor = CreateProcessor(
+            store,
+            new CountingSyncService { Throws = new InvalidOperationException("boom") });
+
+        var before = SyncAttemptCount("failed", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 1, SyncAttemptCount("failed", "none"));
+    }
+
+    [Fact]
+    public async Task Every_candidate_in_a_batch_is_counted_separately()
+    {
+        var store = new FakeAnalyticsSyncStore
+        {
+            Candidates = [Candidate(), Candidate(), Candidate()]
+        };
+        var processor = CreateProcessor(store, new CountingSyncService());
+
+        var before = SyncAttemptCount("synced", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 3, SyncAttemptCount("synced", "none"));
+    }
+
+    [Fact]
+    public async Task A_scan_with_nothing_due_records_no_attempt()
+    {
+        // A worker that found nothing did not try and fail to read metrics, and
+        // counting it as a failure would make an idle hour look like an outage.
+        var processor = CreateProcessor(
+            new FakeAnalyticsSyncStore { Candidates = [] },
+            new CountingSyncService());
+
+        var before = SyncAttemptCount("synced", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before, SyncAttemptCount("synced", "none"));
+    }
+
+    private static long SyncAttemptCount(string outcome, string reason) =>
+        MetricsScrape.CounterOrZero(
+            "mayorx_analytics_sync_attempts_total",
+            ("outcome", outcome),
+            ("reason", reason));
+
     private static AnalyticsSyncProcessor CreateProcessor(
         IAnalyticsSyncStore store,
         IPublishedPostMetricsSyncService service,
@@ -143,6 +228,8 @@ public sealed class AnalyticsSyncProcessorTests
 
         public Queue<MetricsSyncOutcome> Outcomes { get; } = new();
 
+        public Queue<MetricsSyncFailureReason?> Reasons { get; } = new();
+
         public bool ThrowsOnFirst { get; init; }
 
         public Exception? Throws { get; init; }
@@ -166,7 +253,7 @@ public sealed class AnalyticsSyncProcessorTests
             return Task.FromResult(new MetricsSyncAttemptResult(
                 candidate.ContentPostId,
                 Outcomes.Count > 0 ? Outcomes.Dequeue() : MetricsSyncOutcome.Synced,
-                null,
+                Reasons.Count > 0 ? Reasons.Dequeue() : null,
                 null));
         }
     }

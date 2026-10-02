@@ -365,6 +365,7 @@ public sealed class ScheduledPostDbStoreTests
     }
 }
 
+[Collection(ApplicationMetricsCollection.Name)]
 public sealed class ScheduledPostProcessorTests
 {
     [Fact]
@@ -519,6 +520,122 @@ public sealed class ScheduledPostProcessorTests
         Assert.Equal(2, result.Failed);
         Assert.Equal(2, publishService.Attempts.Count);
     }
+
+    [Fact]
+    public async Task A_publish_attempt_is_counted_by_platform_and_outcome()
+    {
+        var store = new FakeScheduledPostStore();
+        store.Add(Due());
+        var processor = CreateProcessor(store);
+
+        var before = PublishAttemptCount("published", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 1, PublishAttemptCount("published", "none"));
+    }
+
+    [Fact]
+    public async Task A_failed_publish_is_counted_with_its_reason()
+    {
+        // The reason is the difference between a rate-limited provider and a
+        // revoked credential, and both arrive as the same outcome.
+        var store = new FakeScheduledPostStore();
+        store.Add(Due());
+        var processor = CreateProcessor(
+            store,
+            new FakeScheduledPostPublishService { Outcome = PublishOutcome.Failed });
+
+        var before = PublishAttemptCount("failed", "provider_unavailable");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 1, PublishAttemptCount("failed", "provider_unavailable"));
+    }
+
+    [Fact]
+    public async Task A_publish_that_threw_is_counted_as_a_failure_without_a_reason()
+    {
+        // Nothing classified the failure, so there is no reason to report. A
+        // series inventing one would point an operator at the wrong cause.
+        var store = new FakeScheduledPostStore();
+        store.Add(Due());
+        var processor = CreateProcessor(
+            store,
+            new FakeScheduledPostPublishService { Throws = true });
+
+        var before = PublishAttemptCount("failed", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 1, PublishAttemptCount("failed", "none"));
+    }
+
+    [Fact]
+    public async Task Every_candidate_in_a_batch_is_counted_separately()
+    {
+        var store = new FakeScheduledPostStore();
+        store.Add(Due());
+        store.Add(Due());
+        var processor = CreateProcessor(store);
+
+        var before = PublishAttemptCount("published", "none");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(before + 2, PublishAttemptCount("published", "none"));
+    }
+
+    [Fact]
+    public async Task A_scan_records_how_many_posts_were_due()
+    {
+        // The due count is what tells an operator whether a spike of publishes is
+        // a backlog clearing or a burst of scheduling.
+        var store = new FakeScheduledPostStore();
+        store.Add(Due());
+        store.Add(Due());
+        store.Add(Due());
+        var processor = CreateProcessor(store);
+
+        var countBefore = DuePostCount();
+        var bucketBefore = DuePostBucket("5");
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(countBefore + 1, DuePostCount());
+        Assert.Equal(bucketBefore + 1, DuePostBucket("5"));
+    }
+
+    [Fact]
+    public async Task A_scan_with_nothing_due_is_still_recorded()
+    {
+        // Otherwise an idle hour would look like a stopped worker, which is the
+        // opposite of what it means.
+        var processor = CreateProcessor(new FakeScheduledPostStore());
+
+        var countBefore = DuePostCount();
+
+        await processor.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(countBefore + 1, DuePostCount());
+    }
+
+    /// <summary>
+    /// Deltas, not exact values: the instruments are process-wide and this class
+    /// publishes against the same platform as every other publish test.
+    /// </summary>
+    private static long PublishAttemptCount(string outcome, string reason) =>
+        MetricsScrape.CounterOrZero(
+            "mayorx_publish_attempts_total",
+            ("platform", "linkedin"),
+            ("outcome", outcome),
+            ("reason", reason));
+
+    private static long DuePostCount() =>
+        MetricsScrape.HistogramCountOrZero("mayorx_scheduled_post_scan_due_posts");
+
+    private static long DuePostBucket(string lessThanOrEqual) =>
+        MetricsScrape.HistogramBucketOrZero("mayorx_scheduled_post_scan_due_posts", lessThanOrEqual);
 
     [Fact]
     public void Every_status_changing_store_method_requires_a_claim()

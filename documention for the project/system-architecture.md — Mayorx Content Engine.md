@@ -1354,12 +1354,59 @@ This list is the target. The only observability surfaces currently registered ar
 | --- | --- |
 | Dependency health for the API host | Implemented. `GET /api/v1/health` runs the PostgreSQL, Redis, and AI-provider configuration checks; `GET /api/v1/health/live` runs none of them. See [System Health](#86-system-health). |
 | Per-request log correlation | Implemented. `X-Correlation-Id` is accepted or generated, echoed in the response, set as `HttpContext.TraceIdentifier`, tagged on the current `Activity`, and added to a logging scope. See [Distributed Tracing](#55-distributed-tracing). |
-| Metrics collection and export | Not implemented. No metrics package is registered and there is no metrics endpoint. |
+| Per-request logging | Implemented. `RequestLoggingMiddleware` writes one line per request with the method, the route template, the status, the duration and the caller's user and workspace ids, and records from a `finally` so a request that threw is still logged. It runs after authentication and before authorization, so a 401 is visible too. Health and metrics routes log at Debug so a probe does not bury a real request. |
+| Metrics collection and export | Implemented. One `System.Diagnostics.Metrics` meter named `Mayorx.ContentEngine` declares every instrument; a single `MeterListener` in `PrometheusMetricsCollector` holds the process totals and renders them as Prometheus text exposition at `GET /api/v1/metrics`. `Metrics:Enabled` defaults to true and removes both the route and the listener when false. See [Metrics](#metrics). |
 | Distributed trace export | Not implemented. No OpenTelemetry or other exporter is registered. |
 | Health endpoint on the worker host | Not implemented. The worker runs no HTTP listener. |
 
-Until a metrics pipeline exists, latency and failure-rate monitoring reads log output
-and the readiness endpoint, not a metrics backend.
+Distributed trace export, the worker health endpoint, database performance, Redis
+performance and worker latency are still unmeasured. What is measured is listed below.
+
+### Metrics
+
+| Instrument | Type | Labels |
+| --- | --- | --- |
+| `mayorx_http_server_requests_total` | counter | `method`, `status_class`, `route` |
+| `mayorx_http_server_request_duration_seconds` | histogram | `method`, `status_class`, `route` |
+| `mayorx_ai_operations_total` | counter | `provider`, `run_type`, `outcome` |
+| `mayorx_ai_operation_duration_seconds` | histogram | `provider`, `run_type` |
+| `mayorx_publish_attempts_total` | counter | `platform`, `outcome`, `reason` |
+| `mayorx_analytics_sync_attempts_total` | counter | `outcome`, `reason` |
+| `mayorx_external_provider_failures_total` | counter | `platform`, `operation`, `failure_class` |
+| `mayorx_worker_poll_runs_total` | counter | `operation`, `outcome` |
+| `mayorx_scheduled_post_scan_due_posts` | histogram | none |
+
+Four properties hold for every instrument above.
+
+**The label set is fixed.** Each label value is an enum, a deployment setting, or a
+route template from the routing table. `route` is the only label derived from a
+caller-supplied request, and it is the template rather than the path, so the number
+of series is bounded by the number of endpoints rather than by what callers ask
+for. A request that matched no endpoint is reported as `unmatched`, and any label
+longer than its limit is reported as `other`.
+
+**The scrape is anonymous and carries nothing that identifies a caller.** No recording
+function accepts a workspace id, a content post id, a path, a query string, a prompt
+or an exception message. AI operations are counted by provider, run type and outcome,
+and the duration is measured rather than inferred, so no series is estimated.
+
+**Instruments are process-wide.** `ApplicationMetrics` is a static registry and the
+listener holds cumulative totals for the life of the process, so a scrape is a
+snapshot rather than a window: counters are cumulative, and histograms keep
+cumulative buckets, `_count` and `_sum`. The listener is resolved while the host is
+being built rather than on the first scrape, because a listener only reports
+measurements made after it starts.
+
+**The worker records into the same meter without exposing it.** The worker poll loop
+records `mayorx_worker_poll_runs_total` through the same static registry, but the
+worker host runs no HTTP listener, so those series are only reachable if a scrape
+endpoint is later added to the worker host.
+
+Three items from the target list above are deliberately absent. AI cost and token
+usage, because the AI provider interface returns generated text and there is no
+measured usage to report. Queue depth, because nothing in the codebase holds a queue
+whose length can be read. And database and Redis performance, which need
+server-side exporters rather than instrumentation of this application.
 
 ---
 

@@ -61,7 +61,10 @@ public abstract class OAuthSocialPlatformPublisher : ISocialPlatformPublisher
         using var response = await _client.SendAsync(message, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            throw SocialProviderHttpFailures.FromStatusCode(response.StatusCode, "publishing");
+            throw SocialProviderHttpFailures.FromStatusCode(
+                response.StatusCode,
+                SocialProviderOperation.Publish,
+                Platform);
         }
 
         JsonDocument document;

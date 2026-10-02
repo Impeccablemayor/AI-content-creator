@@ -1,5 +1,6 @@
 using Api.Application.AnalyticsSync;
 using Api.Configuration;
+using Api.Infrastructure.Metrics;
 using Microsoft.Extensions.Options;
 
 namespace worker;
@@ -30,6 +31,9 @@ public sealed class AnalyticsSyncWorkerService(
             try
             {
                 await RunOnceAsync(stoppingToken);
+                ApplicationMetrics.RecordWorkerPoll(
+                    WorkerOperation.AnalyticsSyncScan,
+                    succeeded: true);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -41,6 +45,10 @@ public sealed class AnalyticsSyncWorkerService(
                 logger.LogError(
                     exception,
                     "Analytics sync scan failed. The next poll will retry.");
+
+                ApplicationMetrics.RecordWorkerPoll(
+                    WorkerOperation.AnalyticsSyncScan,
+                    succeeded: false);
             }
 
             try

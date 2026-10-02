@@ -1502,7 +1502,9 @@ Social integrations
 
 ## Implementation status
 
-**Health monitoring for the API host is implemented. Metrics collection is not.**
+**Health monitoring for the API host and metrics collection and export are
+implemented. A worker health endpoint, distributed tracing and an error tracking
+service are not.**
 
 | Capability | Status |
 | --- | --- |
@@ -1510,17 +1512,52 @@ Social integrations
 | `GET /api/v1/health/live` as a dependency-free probe | Implemented |
 | `X-Correlation-Id` accepted or generated, echoed, and propagated to logs | Implemented |
 | Request ID and trace ID in log output | Implemented via the correlation middleware's logging scope |
-| User ID, workspace ID, operation, duration, and result in log output | Not implemented |
-| Metrics for API latency, error rate, AI latency, AI cost, publication rate, queue depth, worker failures, and sync failures | Not implemented. No metrics package is registered and there is no metrics endpoint. |
+| User ID, workspace ID, operation, duration, and result in log output | Implemented by `RequestLoggingMiddleware`, one line per request, after authentication and before authorization |
+| Metrics for API latency and error rate | Implemented as `mayorx_http_server_requests_total` and `mayorx_http_server_request_duration_seconds`, labelled by method, status class and route template |
+| Metrics for AI latency and failure rate | Implemented as `mayorx_ai_operations_total` and `mayorx_ai_operation_duration_seconds`, labelled by provider, run type and outcome |
+| Metrics for publication success and failure rate | Implemented as `mayorx_publish_attempts_total`, labelled by platform, outcome and reason, one per candidate rather than per run |
+| Metrics for worker failures | Implemented as `mayorx_worker_poll_runs_total`, labelled by operation and outcome |
+| Metrics for analytics sync failures | Implemented as `mayorx_analytics_sync_attempts_total`, plus `mayorx_external_provider_failures_total` for the provider failures behind them |
+| Metrics for AI token usage and AI cost | Not implemented. The AI provider interface returns generated text only, so there is no measured usage to report and a series would have to be guessed |
+| Metrics for queue depth | Not implemented. Nothing in the codebase holds a queue whose length can be read |
+| Social platform failure classification in metrics | Implemented as `mayorx_external_provider_failures_total`, with `failure_class` distinguishing authentication, unavailable and request failures |
 | Worker and social integration health endpoints | Not implemented. Only the API host exposes health endpoints. |
 | AI provider monitoring | Configuration only. Readiness reports whether a provider and model are configured, and makes no call to the provider. |
 
-The `Never log` list above holds for the implemented logging: the AI readiness check
-reports the provider and model and never the API key, and the correlation header is
-validated before it reaches a log line or a response header.
+### How the metrics are collected
 
-The metrics list is the target. Until it exists, latency and failure-rate questions are
-answered from log output and from the readiness endpoint.
+`System.Diagnostics.Metrics`, with no third-party exporter. One meter,
+`Mayorx.ContentEngine`, declares every instrument in `ApplicationMetrics`, which is
+the only supported way to record them. `PrometheusMetricsCollector` holds one
+`MeterListener` for the process lifetime and renders the snapshot as Prometheus text
+exposition at `GET /api/v1/metrics`, content type
+`text/plain; version=0.0.4; charset=utf-8`. `Metrics:Enabled` defaults to `true`;
+`false` removes both the route and the listener, so nothing is collected for an
+endpoint nobody reads.
+
+Three decisions are worth stating because they are not the obvious ones.
+
+**Counters are `Counter<long>` and histograms are `Histogram<double>`.** The BCL's
+`Instrument` does not report which kind it is, so the collector tells them apart by
+the value type it is handed. `mayorx_scheduled_post_scan_due_posts` is a histogram
+even though its value is a count, for exactly this reason.
+
+**The collector is resolved while the host is built, not on the first scrape.** A
+listener only reports measurements made after it starts, so a lazily created
+collector would lose everything the process did before the first scrape.
+
+**Every label is bounded at the recording site.** `RecordPublishAttempt` takes a
+`ContentPlatform`, a `PublishOutcome` and a nullable `PublishFailureReason`; there is
+no parameter that could accept a workspace id, a content post id, a path or an
+exception message. Provider failures are counted inside the one function that
+classifies them, so a new provider path cannot be added and left uncounted.
+
+The `Never log` list above holds for the implemented logging, and the same
+constraint is what keeps the scrape free of secrets: the AI readiness check reports
+the provider and model and never the API key, the correlation header is validated
+before it reaches a log line or a response header, and the request log carries the
+method, the route template, the status, the duration and the caller's ids, never a
+path, a query string, a body, a header or a token.
 
 ---
 
@@ -2236,7 +2273,7 @@ Production Deployment
 
 | Deliverable | Status |
 | --- | --- |
-| Monitoring | Partially delivered. Dependency health and per-request log correlation exist; metrics collection does not. |
+| Monitoring | Delivered. Dependency health, per-request log correlation, one request log line per request, and Prometheus metrics collection with an anonymous scrape endpoint all exist. A worker health endpoint, dashboards and alerts do not. |
 | Error Tracking | Not started. Errors are logged and returned in the standard error envelope; nothing is forwarded to a tracking service. |
 | CI/CD | Delivered. A workflow restores, builds with warnings as errors, runs the unit tests, then starts PostgreSQL and Redis with the project's compose file and runs the integration tests. |
 | Security Review | Not started |

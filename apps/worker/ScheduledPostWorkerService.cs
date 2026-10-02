@@ -1,5 +1,6 @@
 using Api.Application.Scheduling;
 using Api.Configuration;
+using Api.Infrastructure.Metrics;
 using Microsoft.Extensions.Options;
 
 namespace worker;
@@ -31,6 +32,9 @@ public sealed class ScheduledPostWorkerService(
             try
             {
                 await RunOnceAsync(stoppingToken);
+                ApplicationMetrics.RecordWorkerPoll(
+                    WorkerOperation.ScheduledPostScan,
+                    succeeded: true);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -42,6 +46,10 @@ public sealed class ScheduledPostWorkerService(
                 logger.LogError(
                     exception,
                     "Scheduled post scan failed. The next poll will retry.");
+
+                ApplicationMetrics.RecordWorkerPoll(
+                    WorkerOperation.ScheduledPostScan,
+                    succeeded: false);
             }
 
             try

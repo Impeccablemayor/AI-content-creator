@@ -118,6 +118,17 @@ public sealed class AiRunRecorder : IAiRunRecorder
     {
         var now = DateTime.UtcNow;
 
+        // Counted here rather than in the services that call this recorder. Every
+        // AI operation records exactly one run, success or failure, so this is the
+        // one place that can count each attempt once and be sure it counted it at
+        // all. Counted before the write below because the write is a diagnostic:
+        // its success or failure says nothing about the operation it describes.
+        Infrastructure.Metrics.ApplicationMetrics.RecordAiOperation(
+            _aiOptions.Value.Provider,
+            runType,
+            status == AIRunStatus.Succeeded,
+            duration);
+
         var run = new AiRun
         {
             Id = Guid.NewGuid(),

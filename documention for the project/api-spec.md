@@ -2822,20 +2822,26 @@ Persistence
 
 # 52. Health and Observability
 
-The API exposes two operational endpoints and one correlation header. Both endpoints
-are **anonymous**: a load balancer, a container orchestrator, or a CI job polls them
-without credentials, so neither requires a workspace or a role.
+The API exposes three operational endpoints and one correlation header. All three
+endpoints are **anonymous**: a load balancer, a container orchestrator, a Prometheus
+server, or a CI job polls them without credentials, so none of them requires a
+workspace or a role.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/v1/health` | Readiness. Runs the dependency checks. |
 | `GET` | `/api/v1/health/live` | Liveness. Runs no dependency check. |
+| `GET` | `/api/v1/metrics` | Metrics. Prometheus text exposition of this process's counters and histograms. |
 
-Both live under the `/api/v1` base path like every other endpoint, and both answer
-with the standard success envelope described in
+The two health endpoints live under the `/api/v1` base path like every other
+endpoint, and both answer with the standard success envelope described in
 [Common Response Format](#9-common-response-format). There is no per-dependency
 route such as `/health/postgres`; a caller that wants one dependency's detail reads
 the named entry in `data.checks`.
+
+The metrics endpoint is the one exception to the envelope: a scraper expects
+`text/plain`, not JSON, and is not a client of the API. It is also excluded from the
+generated OpenAPI document.
 
 ---
 
@@ -2985,6 +2991,120 @@ dependency failure into a crash loop.
 
 Both health endpoints are on the API host only. The background worker exposes no
 health endpoint and no HTTP listener.
+
+---
+
+## GET `/api/v1/metrics`
+
+Prometheus text exposition of every instrument this process declares.
+
+Unlike the health endpoints, this route is not wrapped in the standard success
+envelope. A scraper parses the body as Prometheus text, so the response is:
+
+| Property | Value |
+| --- | --- |
+| Content type | `text/plain; version=0.0.4; charset=utf-8` |
+| Status code | Always `200` |
+| Body | Prometheus text exposition, version `0.0.4` |
+| Authentication | None |
+| In OpenAPI document | No |
+
+### Instruments
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `mayorx_http_server_requests_total` | counter | `method`, `status_class`, `route` |
+| `mayorx_http_server_request_duration_seconds` | histogram | `method`, `status_class`, `route` |
+| `mayorx_ai_operations_total` | counter | `provider`, `run_type`, `outcome` |
+| `mayorx_ai_operation_duration_seconds` | histogram | `provider`, `run_type` |
+| `mayorx_publish_attempts_total` | counter | `platform`, `outcome`, `reason` |
+| `mayorx_analytics_sync_attempts_total` | counter | `outcome`, `reason` |
+| `mayorx_external_provider_failures_total` | counter | `platform`, `operation`, `failure_class` |
+| `mayorx_worker_poll_runs_total` | counter | `operation`, `outcome` |
+| `mayorx_scheduled_post_scan_due_posts` | histogram | none |
+
+A representative scrape, abbreviated to one series:
+
+```text
+# HELP mayorx_http_server_requests_total HTTP requests handled by the API.
+# TYPE mayorx_http_server_requests_total counter
+mayorx_http_server_requests_total{method="GET",status_class="2xx",route="/api/v1/health/live"} 4
+# HELP mayorx_http_server_request_duration_seconds Time spent handling an HTTP request, in seconds.
+# TYPE mayorx_http_server_request_duration_seconds histogram
+mayorx_http_server_request_duration_seconds_bucket{method="GET",status_class="2xx",route="/api/v1/health/live",le="0.005"} 4
+mayorx_http_server_request_duration_seconds_bucket{method="GET",status_class="2xx",route="/api/v1/health/live",le="0.01"} 4
+...
+mayorx_http_server_request_duration_seconds_bucket{method="GET",status_class="2xx",route="/api/v1/health/live",le="+Inf"} 4
+mayorx_http_server_request_duration_seconds_sum{method="GET",status_class="2xx",route="/api/v1/health/live"} 0.0081
+mayorx_http_server_request_duration_seconds_count{method="GET",status_class="2xx",route="/api/v1/health/live"} 4
+```
+
+Labels are emitted in the order the instrument declared them, and a histogram emits
+its buckets, then `+Inf`, then `_sum`, then `_count`.
+
+### Label policy
+
+Every label value is an enum, a deployment setting, or a route template from the
+routing table:
+
+| Label | Values |
+| --- | --- |
+| `method` | The HTTP method, `other` beyond 64 characters |
+| `status_class` | `1xx` through `5xx`, or `unknown` |
+| `route` | The endpoint route template, `unmatched` when no endpoint matched, `other` beyond 128 characters |
+| `provider` | The configured AI provider name, `other` beyond 32 characters |
+| `run_type` | `research`, `idea_generation`, `opportunity_scoring`, `strategy`, `content_generation`, `platform_optimization`, `quality_evaluation`, `fact_verification`, `performance_analysis`, `learning`, `embedding`, or `other` |
+| `outcome` | `succeeded`/`failed` for AI and worker polls; `published`/`failed`/`skipped` for publishing; `synced`/`skipped`/`failed` for analytics sync |
+| `platform` | `linkedin`, `x`, or `other` |
+| `reason` | `none`, or a snake_case publish or sync failure reason such as `credentials_expired` |
+| `operation` | `scheduled_post_scan` or `analytics_sync_scan` for worker polls; `oauth_token`, `oauth_profile`, `publish` or `metrics` for provider failures |
+| `failure_class` | `authentication`, `unavailable`, or `request` |
+
+`linkedin` is spelled the way the platform spells its own name rather than
+`linked_in`, because a typo in a label name becomes a typo in every dashboard built
+on it.
+
+Because the label set is fixed and `route` is the template rather than the path,
+the number of time series is bounded by the number of endpoints, not by what
+callers request. A caller who asks for `/api/v1/content/posts/does-not-exist` and a
+caller who asks for a real id increment the same `route` series.
+
+No recording function accepts a workspace id, a content post id, a social account
+id, a raw path, a query string, a prompt, a token, or an exception message, so none
+of those can reach the scrape.
+
+### Values
+
+Counters are cumulative for the life of the process and never reset between
+scrapes. Histograms expose cumulative `_bucket`, `_sum` and `_count` series, with
+`le` buckets that include `+Inf`. A scrape is a snapshot of the process, not a
+window; rate queries are left to the monitoring backend.
+
+### Series deliberately absent
+
+- **AI token usage and cost.** The AI provider interface returns generated text
+  only, so there is no measured usage behind a series, and a guessed series is worse
+  than a missing one.
+- **Queue depth.** Nothing in the codebase holds a queue whose length can be read.
+- **Worker series.** The worker records `mayorx_worker_poll_runs_total` into the
+  same meter, but the worker host runs no HTTP listener, so those series are not
+  reachable from this route.
+- **Database and Redis performance.** Those need server-side exporters, not
+  instrumentation of this application.
+
+### Configuration
+
+`Metrics:Enabled` defaults to `true`. When it is `false` the route is not mapped and
+the listener is not registered, so nothing is collected for an endpoint nobody reads.
+The listener is created while the host is being built rather than on the first
+scrape, because a `MeterListener` only reports measurements made after it starts;
+a lazily created collector would return an empty first scrape for a process that had
+already served requests.
+
+This route records itself like any other request, so a scrape shows up in
+`mayorx_http_server_requests_total` one scrape behind. That is intentional: hiding
+it would make the endpoint the one request the log and the metrics cannot account
+for.
 
 ---
 

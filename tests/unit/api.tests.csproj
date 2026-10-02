@@ -21,6 +21,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\apps\api\api.csproj" />
+    <!-- The worker's poll loop is where a background failure is counted, and the
+         loop is only reachable by running the service. -->
+    <ProjectReference Include="..\..\apps\worker\worker.csproj" />
   </ItemGroup>
 
 </Project>
