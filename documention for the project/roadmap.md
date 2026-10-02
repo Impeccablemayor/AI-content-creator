@@ -180,6 +180,26 @@ Build the underlying platform architecture required for the product.
 - Database migrations
 - Basic observability
 
+### Health and observability status
+
+The observability foundation listed above is built; the monitoring stack around it is
+not.
+
+| Capability | Status |
+| --- | --- |
+| `GET /api/v1/health` | Implemented. Checks PostgreSQL, Redis, and AI provider configuration, and answers `503` when a dependency is down |
+| `GET /api/v1/health/live` | Implemented. Runs no dependency check, so an outage does not trigger a restart loop |
+| `X-Correlation-Id` | Implemented. Accepted or generated, echoed on the response, and applied to tracing and a logging scope |
+| Metrics collection and export | Not implemented |
+| Distributed trace export | Not implemented |
+| Error tracking service | Not implemented |
+| Worker health endpoint | Not implemented, the worker runs no HTTP listener |
+
+The reliability of that foundation is now partly proven rather than asserted. A
+dedicated integration test project runs the real composition root against the
+repository's own PostgreSQL and Redis, applies the real migrations, and substitutes
+only the social platform and the model. See the Engineering Gate below.
+
 ## Outcome
 
 At the end of this phase, the product should have a stable foundation capable of supporting the MVP.
@@ -1124,6 +1144,7 @@ Each major phase should meet a release gate.
 - No unresolved critical defects
 - Database migrations are reliable
 - Background jobs are recoverable
+- Readiness reports real dependency state, and liveness does not
 
 ## AI Gate
 

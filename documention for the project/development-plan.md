@@ -353,6 +353,35 @@ Readiness should eventually verify dependencies such as:
 - PostgreSQL.
 - Redis.
 
+### Implementation status
+
+**Implemented, at different routes than the example above.** The API exposes:
+
+| Route | Kind | Behaviour |
+| --- | --- | --- |
+| `GET /api/v1/health` | Readiness | Runs the `postgres`, `redis`, and `ai-provider` checks. `503` when any is unhealthy, `200` otherwise. |
+| `GET /api/v1/health/live` | Liveness | Runs no check. Always `200`. |
+
+Both are anonymous, both answer in the standard response envelope, and there is no
+per-dependency route. Readiness keeps the `data.status` and `data.service` fields the
+earlier hardcoded controller returned, so an existing client comparing
+`data.status == "healthy"` still works.
+
+The AI check reads configuration only and reports `degraded`, not `unhealthy`, when no
+provider is configured: a readiness probe must not depend on a third party being
+reachable, and local development and CI legitimately run without an API key. `degraded`
+still answers `200`, so a missing optional capability does not take an instance out of
+rotation.
+
+`X-Correlation-Id` is handled by `CorrelationIdMiddleware`, which runs first in the
+pipeline. It is accepted from the request when well formed and generated otherwise,
+returned on the response, set as `HttpContext.TraceIdentifier`, tagged on the current
+`Activity`, and added to a logging scope. Error bodies already report the same value as
+`traceId`.
+
+Not implemented: metrics endpoints, a trace exporter, and a health endpoint on the
+worker.
+
 ## Deliverable
 
 The API starts successfully and exposes documented health endpoints.
@@ -1471,6 +1500,28 @@ AI provider
 Social integrations
 ```
 
+## Implementation status
+
+**Health monitoring for the API host is implemented. Metrics collection is not.**
+
+| Capability | Status |
+| --- | --- |
+| `GET /api/v1/health` reporting PostgreSQL, Redis, and AI provider state | Implemented |
+| `GET /api/v1/health/live` as a dependency-free probe | Implemented |
+| `X-Correlation-Id` accepted or generated, echoed, and propagated to logs | Implemented |
+| Request ID and trace ID in log output | Implemented via the correlation middleware's logging scope |
+| User ID, workspace ID, operation, duration, and result in log output | Not implemented |
+| Metrics for API latency, error rate, AI latency, AI cost, publication rate, queue depth, worker failures, and sync failures | Not implemented. No metrics package is registered and there is no metrics endpoint. |
+| Worker and social integration health endpoints | Not implemented. Only the API host exposes health endpoints. |
+| AI provider monitoring | Configuration only. Readiness reports whether a provider and model are configured, and makes no call to the provider. |
+
+The `Never log` list above holds for the implemented logging: the AI readiness check
+reports the provider and model and never the API key, and the correlation header is
+validated before it reaches a log line or a response header.
+
+The metrics list is the target. Until it exists, latency and failure-rate questions are
+answered from log output and from the readiness endpoint.
+
 ---
 
 # 20. Phase 15 — Security Hardening
@@ -1573,6 +1624,36 @@ Test:
 - Publishing workflow.
 
 Use isolated test environments.
+
+### Implementation status
+
+A separate integration test project now exists alongside the unit tests. It hosts the
+real composition root through `WebApplicationFactory<Program>` against the
+repository's own PostgreSQL and Redis from `docker-compose.yml`.
+
+Each run creates its own database, applies the real migrations, and drops it
+afterwards, so a run cannot collide with a developer's data and the schema under test is
+the schema a deployment applies. The database is never mocked, because the database is
+the part under test.
+
+Only the two edges that need the internet are substituted: the social platform and the
+model. The scheduler, publish service, credential protector, metrics store, reporting
+service, analyser, and persistence are the production types.
+
+| Coverage | Status |
+| --- | --- |
+| API + PostgreSQL, real migrations | Implemented |
+| API + Redis | Implemented |
+| Publishing loop: scheduled post through publish, platform identity, metrics ingestion, reporting, persisted learning signal | Implemented |
+| Workspace isolation and direct read across the boundary by identifier | Implemented |
+| Readiness healthy, and readiness unhealthy with both dependencies unreachable | Implemented |
+| Liveness independent of dependency state | Implemented |
+| `X-Correlation-Id` generated and echoed | Implemented |
+| Unauthenticated request rejected, still correlatable | Implemented |
+| Authentication and authorization success paths | Not covered by this project; covered by the unit test project |
+
+CI starts PostgreSQL and Redis with the project's own compose file before running these
+tests, and tears them down afterwards.
 
 ---
 
@@ -2150,6 +2231,18 @@ Backup Strategy
 CI/CD
 Production Deployment
 ```
+
+### Implementation status
+
+| Deliverable | Status |
+| --- | --- |
+| Monitoring | Partially delivered. Dependency health and per-request log correlation exist; metrics collection does not. |
+| Error Tracking | Not started. Errors are logged and returned in the standard error envelope; nothing is forwarded to a tracking service. |
+| CI/CD | Delivered. A workflow restores, builds with warnings as errors, runs the unit tests, then starts PostgreSQL and Redis with the project's compose file and runs the integration tests. |
+| Security Review | Not started |
+| Performance Testing | Not started |
+| Backup Strategy | Not started |
+| Production Deployment | Not started |
 
 ---
 

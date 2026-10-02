@@ -1265,9 +1265,9 @@ failed publish keeps its claim, so it is not attempted again until the claim
 expires.
 
 Multi-instance safety comes from the atomic conditional update in the database,
-not from Redis. Redis exists in this solution only as a health check, and adding
-a distributed lock layer before a publishing subsystem exists would be
-premature.
+not from Redis. Redis carries single-use OAuth state and is probed by
+`GET /api/v1/health`; adding a distributed lock layer before a publishing
+subsystem exists would be premature.
 
 Deliberately not implemented: manual publish, unscheduling a post, publication
 history or a per-attempt record, calendar or drag-to-reschedule UX, token
@@ -2820,7 +2820,212 @@ Persistence
 
 ---
 
-# 52. MVP Endpoint Set
+# 52. Health and Observability
+
+The API exposes two operational endpoints and one correlation header. Both endpoints
+are **anonymous**: a load balancer, a container orchestrator, or a CI job polls them
+without credentials, so neither requires a workspace or a role.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/health` | Readiness. Runs the dependency checks. |
+| `GET` | `/api/v1/health/live` | Liveness. Runs no dependency check. |
+
+Both live under the `/api/v1` base path like every other endpoint, and both answer
+with the standard success envelope described in
+[Common Response Format](#9-common-response-format). There is no per-dependency
+route such as `/health/postgres`; a caller that wants one dependency's detail reads
+the named entry in `data.checks`.
+
+---
+
+## GET `/api/v1/health`
+
+Readiness. Answers whether this instance can actually serve requests right now.
+
+Registered checks:
+
+| Check name | What it does | Fails when |
+| --- | --- | --- |
+| `postgres` | Opens a short-lived connection and runs `SELECT 1` | The connection string is missing, or the database cannot be reached |
+| `redis` | Pings the shared `IConnectionMultiplexer` | Redis cannot be reached |
+| `ai-provider` | Reads the configured provider name, the resolved provider type, and the model. **No network call.** | Never. An unconfigured provider is `degraded`, not `unhealthy`. |
+
+The aggregate `data.status` is the worst individual status, so a `503` names the
+dependency that failed rather than asserting the service is fine.
+
+### Status codes
+
+| HTTP status | `data.status` | Condition |
+| --- | --- | --- |
+| `200` | `healthy` | Every check is healthy |
+| `200` | `degraded` | No check is unhealthy, but at least one is degraded |
+| `503` | `unhealthy` | At least one check is unhealthy |
+
+`degraded` deliberately still answers `200`. An instance with no AI provider
+configured can serve every endpoint that does not generate content, and a probe that
+failed it would take a working deployment out of rotation for a condition that is
+visible and reportable in the body.
+
+### Response
+
+```json
+{
+  "data": {
+    "status": "healthy",
+    "service": "mayorx-content-engine-api",
+    "totalDurationMs": 12,
+    "checks": {
+      "ai-provider": {
+        "status": "healthy",
+        "description": "AI provider Groq (OpenAiProvider) using model openai/gpt-oss-20b.",
+        "durationMs": 0
+      },
+      "postgres": {
+        "status": "healthy",
+        "description": "PostgreSQL is reachable.",
+        "durationMs": 8
+      },
+      "redis": {
+        "status": "healthy",
+        "description": "Redis is healthy.",
+        "durationMs": 4
+      }
+    }
+  },
+  "message": "Service is healthy"
+}
+```
+
+When a dependency is down the status code becomes `503`, `data.status` becomes
+`unhealthy`, and `message` becomes `"One or more dependencies are unavailable"`:
+
+```json
+{
+  "data": {
+    "status": "unhealthy",
+    "service": "mayorx-content-engine-api",
+    "totalDurationMs": 2106,
+    "checks": {
+      "ai-provider": {
+        "status": "healthy",
+        "description": "AI provider Groq (OpenAiProvider) using model openai/gpt-oss-20b.",
+        "durationMs": 0
+      },
+      "postgres": {
+        "status": "unhealthy",
+        "description": "PostgreSQL is unavailable.",
+        "durationMs": 2003
+      },
+      "redis": {
+        "status": "unhealthy",
+        "description": "Redis is unavailable.",
+        "durationMs": 103
+      }
+    }
+  },
+  "message": "One or more dependencies are unavailable"
+}
+```
+
+Response fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `data.status` | string | `healthy`, `degraded`, or `unhealthy`, always lowercase |
+| `data.service` | string | Always `mayorx-content-engine-api` |
+| `data.totalDurationMs` | number | Wall-clock duration of the whole check run, rounded |
+| `data.checks` | object | Keyed by check name; every registered check is present |
+| `data.checks.*.status` | string | Lowercase, same value set as `data.status` |
+| `data.checks.*.description` | string or `null` | Human-readable reason. Never contains an API key. |
+| `data.checks.*.durationMs` | number | That check's own duration, rounded |
+| `message` | string | `Service is healthy`, or `One or more dependencies are unavailable` |
+
+The lowercase `status` values and the `data.status` / `data.service` fields are the
+ones the previous hardcoded controller returned, and a healthy instance still reports
+`"healthy"`. Existing clients keep working; `data.checks`, `data.totalDurationMs`, and
+the `503` are additive.
+
+Two deliberate non-behaviours:
+
+- The `postgres` check runs `SELECT 1`, not an application query. A missing table
+  means the deployment is mis-migrated, which is a deployment problem, not a reason
+  for an orchestrator to restart a process that is otherwise serving.
+- The `ai-provider` check reads configuration only. A readiness probe that called a
+  model would make every probe, every orchestrator poll, and every CI run depend on a
+  third party being reachable, and a provider outage would then fail the whole
+  service.
+
+---
+
+## GET `/api/v1/health/live`
+
+Liveness. Answers only whether this process can serve a request, and consults
+nothing.
+
+It always answers `200` with `data.status` `"healthy"` and an empty `data.checks`
+object, because no check was selected:
+
+```json
+{
+  "data": {
+    "status": "healthy",
+    "service": "mayorx-content-engine-api",
+    "totalDurationMs": 0,
+    "checks": {}
+  },
+  "message": "Service is healthy"
+}
+```
+
+This is the endpoint a container liveness probe and a restart policy should poll.
+Pointing a restart policy at `/api/v1/health` instead means a database outage
+restarts an API process that is perfectly able to answer, which turns a recoverable
+dependency failure into a crash loop.
+
+Both health endpoints are on the API host only. The background worker exposes no
+health endpoint and no HTTP listener.
+
+---
+
+## `X-Correlation-Id`
+
+One identifier carries a request through the log output, the response header, and
+the `traceId` on an error body.
+
+Request behaviour:
+
+- If the request carries `X-Correlation-Id` and the value is acceptable, that value
+  is reused, so an ingress or upstream service can hand the API the id its own logs
+  are already filed under.
+- Otherwise the identifier is generated from the current request activity's trace id,
+  and only if there is no ambient activity at all is a fresh GUID used.
+- An inbound value is ignored unless it is non-empty, at most 128 characters, and
+  contains only ASCII letters, digits, `-`, `_`, `.`, or `:`. A rejected value is
+  replaced rather than trusted, because the value reaches a response header and the
+  log stream.
+
+Response behaviour:
+
+- The same value is always returned in the `X-Correlation-Id` response header,
+  including on responses that end early and carry no body, such as a `404`.
+- The value is set as `HttpContext.TraceIdentifier`, so the `traceId` in the
+  [Error Response Format](#10-error-response-format) is the same id the request was
+  logged under.
+- The value is set as a tag on the current `Activity` and added to a logging scope
+  alongside `TraceId`, so every log line written during the request carries it.
+
+The middleware deliberately does not create its own `Activity` or start a span; it
+reads the ambient one, so existing tracing behaviour is not forked and only logging
+correlation is added.
+
+> **Not implemented:** the identifier is not persisted, and no correlation id is
+> stored against posts, publications, jobs, or audit entries. No trace exporter is
+> configured, so this is log correlation, not distributed tracing.
+
+---
+
+# 53. MVP Endpoint Set
 
 The first implementation should focus on the smallest useful API.
 
@@ -2930,7 +3135,7 @@ GET /analytics/posts/{contentPostId}
 
 ---
 
-# 53. Example End-to-End Flow
+# 54. Example End-to-End Flow
 
 A normal automated content workflow should look like:
 
@@ -2970,7 +3175,7 @@ A normal automated content workflow should look like:
 
 ---
 
-# 54. Future API Extensions
+# 55. Future API Extensions
 
 These are intentionally outside the initial MVP:
 
@@ -2994,7 +3199,7 @@ These should only be introduced when the core publishing and learning loop is st
 
 ---
 
-# 55. API Design Principle
+# 56. API Design Principle
 
 The API should remain a **stable application contract**, even when internal implementation changes.
 

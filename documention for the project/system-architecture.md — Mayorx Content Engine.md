@@ -1346,6 +1346,21 @@ Redis health
 External API failures
 ```
 
+### What exists today
+
+This list is the target. The only observability surfaces currently registered are:
+
+| Capability | Status |
+| --- | --- |
+| Dependency health for the API host | Implemented. `GET /api/v1/health` runs the PostgreSQL, Redis, and AI-provider configuration checks; `GET /api/v1/health/live` runs none of them. See [System Health](#86-system-health). |
+| Per-request log correlation | Implemented. `X-Correlation-Id` is accepted or generated, echoed in the response, set as `HttpContext.TraceIdentifier`, tagged on the current `Activity`, and added to a logging scope. See [Distributed Tracing](#55-distributed-tracing). |
+| Metrics collection and export | Not implemented. No metrics package is registered and there is no metrics endpoint. |
+| Distributed trace export | Not implemented. No OpenTelemetry or other exporter is registered. |
+| Health endpoint on the worker host | Not implemented. The worker runs no HTTP listener. |
+
+Until a metrics pipeline exists, latency and failure-rate monitoring reads log output
+and the readiness endpoint, not a metrics backend.
+
 ---
 
 # 54. Logging
@@ -1367,6 +1382,16 @@ Example:
 
 Sensitive values must never be logged.
 
+### What exists today
+
+Logs come from the default ASP.NET Core providers. The built-in request logging is
+not reconfigured, and no logging framework is registered.
+
+Every log line written during a request carries the values from the
+`CorrelationIdMiddleware` scope: `X-Correlation-Id` and `TraceId`. That scope is the
+only request-scoped logging enrichment in place; the user ID, workspace ID,
+operation, duration, and result fields in the example above are not emitted.
+
 ---
 
 # 55. Distributed Tracing
@@ -1386,6 +1411,32 @@ Database
 ```
 
 to be traced through a shared correlation ID.
+
+### What exists today
+
+Only the correlation ID is implemented, and only inside the API host. There is no
+trace exporter, no span hierarchy across processes, and no persisted correlation
+store.
+
+`CorrelationIdMiddleware` runs first in the API pipeline, before
+`GlobalExceptionMiddleware`, and for each request it:
+
+1. Reuses an inbound `X-Correlation-Id` when it is non-empty, at most 128 characters,
+   and contains only ASCII letters, digits, `-`, `_`, `.`, or `:`; otherwise
+2. Falls back to the current `Activity`'s trace id, and generates a GUID only when no
+   ambient activity exists, and then
+3. Sets the value as `HttpContext.TraceIdentifier`, as a tag on the current
+   `Activity`, in the `X-Correlation-Id` response header, and in a logging scope
+   alongside `TraceId`.
+
+Because it reads the ambient activity rather than starting its own, it does not fork
+the trace the runtime already maintains. Because it runs first, a failure logged by
+the exception handler cites the same identifier the caller was handed.
+
+Deliberately not implemented: propagating the id to the worker or to external
+providers, storing it on posts, publications, jobs, or audit entries, and exporting
+spans. The worker is a separate host with no HTTP surface, so a request-scoped header
+does not reach it.
 
 ---
 
@@ -2125,6 +2176,60 @@ Example:
 ```
 
 These should be protected appropriately where necessary.
+
+### What exists today
+
+The routes sketched above are not the ones that were built. The API host exposes two
+endpoints instead, both anonymous and both under the versioned base path:
+
+| Route | Kind | Dependency checks |
+| --- | --- | --- |
+| `GET /api/v1/health` | Readiness | `postgres`, `redis`, `ai-provider` |
+| `GET /api/v1/health/live` | Liveness | None |
+
+There is deliberately no per-dependency route. A single readiness response names every
+dependency and its status, so an orchestrator gets one decision and an operator gets
+one place to read, instead of three probes that can disagree.
+
+Implementation:
+
+```text
+apps/api/
+├── Infrastructure/Health/HealthResponseWriter.cs     shared envelope + status mapping
+├── Infrastructure/Health/AiProviderReadinessCheck.cs
+├── Infrastructure/Persistence/PostgresHealthCheck.cs
+└── Infrastructure/Redis/RedisHealthCheck.cs
+```
+
+- `postgres` opens a short-lived connection and runs `SELECT 1`, deliberately not an
+  application query. A missing table is a mis-migrated deployment, not a reason for an
+  orchestrator to restart a process that is otherwise serving.
+- `redis` pings the same `IConnectionMultiplexer` the distributed cache uses, so the
+  probe and the OAuth state cache report the same server's state.
+- `ai-provider` reads configuration only. A probe that called a model would make every
+  readiness poll depend on a third party being reachable and fast, so an unconfigured
+  or slow provider is reported as `degraded` instead of failing readiness.
+
+Both endpoints share one response writer so an orchestrator and an API client parse
+one envelope. Readiness answers `503` when the aggregate status is `unhealthy` and `200`
+otherwise; `degraded` is still a `200`, because an instance missing an optional
+capability can serve traffic. The envelope keeps the `data.status` and `data.service`
+fields the previous hardcoded controller returned, with lowercase status values, so
+existing clients are unaffected; `data.checks` and `data.totalDurationMs` are additive.
+
+`AbortOnConnectFail` is set to `false` on the Redis multiplexer unless the connection
+string overrides it. At the library default the first resolve during an outage throws,
+which escaped the health check and answered `500` instead of `503`, turning a cache
+outage into an error page.
+
+Not implemented: a health endpoint on the worker host, and any protection on these two
+routes. They are anonymous by design so an orchestrator or load balancer can poll them
+without credentials. They expose no secrets — the AI check reports the provider and
+model but never the API key — so the exposure is acceptable, but a deployment that
+requires protected probes must put them behind its own gateway.
+
+See section 52, Health and Observability, in [api-spec.md](api-spec.md) for the exact
+request and response contract.
 
 ---
 
