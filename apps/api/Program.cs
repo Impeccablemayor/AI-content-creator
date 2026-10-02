@@ -27,6 +27,9 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.OpenApi;
 using Microsoft.IdentityModel.Tokens;
 
+/// <summary>Named CORS policy the pipeline applies.</summary>
+const string CorsPolicyName = "ApiCorsPolicy";
+
 var environmentName = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT")
     ?? Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")
     ?? "Production";
@@ -206,9 +209,71 @@ builder.Services
     });
 
 builder.Services.AddAuthorization();
+
+builder.Services
+    .AddOptions<RateLimitingOptions>()
+    .Bind(builder.Configuration.GetSection(RateLimitingOptions.SectionName))
+    .Validate(
+        options => options.AuthenticationPermitLimit >= 0,
+        "Rate limiting permit limit must not be negative.")
+    .Validate(
+        options => options.AuthenticationWindow
+            > TimeSpan.Zero,
+        "Rate limiting window must be positive.")
+    .ValidateOnStart();
+
+// Origins come from configuration only. No wildcard and no built-in default
+// origin: the repository has no frontend to infer one from, and shipping a
+// guessed development origin into production would be a silent weakening.
+// Outside Development an empty list is a configuration mistake, so it stops
+// startup rather than quietly allowing every origin.
+builder.Services
+    .AddOptions<CorsOptions>()
+    .Bind(builder.Configuration.GetSection(CorsOptions.SectionName));
+
+var allowedOrigins = builder.Configuration
+    .GetSection(CorsOptions.SectionName)
+    .Get<CorsOptions>()?
+    .AllowedOrigins?
+    .Where(origin => !string.IsNullOrWhiteSpace(origin))
+    .Select(origin => origin.Trim())
+    .Distinct(StringComparer.OrdinalIgnoreCase)
+    .ToArray()
+    ?? [];
+
+if (allowedOrigins.Length == 0 && !builder.Environment.IsDevelopment())
+{
+    throw new InvalidOperationException(
+        $"No CORS origins are configured. Set " +
+        $"'{CorsOptions.SectionName}:AllowedOrigins' to the exact frontend " +
+        "origins permitted to call this API, or run in Development.");
+}
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(CorsPolicyName, policy =>
+    {
+        if (allowedOrigins.Length == 0)
+        {
+            // Development with nothing configured: no browser origin is
+            // permitted, which is the same position as production.
+            policy.WithOrigins([]);
+        }
+        else
+        {
+            policy
+                .WithOrigins(allowedOrigins)
+                .AllowAnyHeader()
+                .AllowAnyMethod()
+                .AllowCredentials();
+        }
+    });
+});
+
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<CurrentUserService>();
 builder.Services.AddScoped<JwtTokenService>();
+builder.Services.AddScoped<IRefreshTokenService, RefreshTokenService>();
 builder.Services.AddScoped<IContentIdeaService, ContentIdeaService>();
 builder.Services.AddScoped<IContentPillarService, ContentPillarService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();
@@ -275,11 +340,16 @@ if (aiOptions.Provider.Equals("Unavailable", StringComparison.OrdinalIgnoreCase)
 // logs and reports under one identifier.
 app.UseMiddleware<CorrelationIdMiddleware>();
 
-// Global exception handling
-app.UseMiddleware<GlobalExceptionMiddleware>();
+// Oversized bodies are refused before anything reads them. The ceiling itself is
+// read by the middleware from RequestSizeLimit:MaxRequestBodySizeInBytes.
+app.UseMiddleware<RequestSizeLimitMiddleware>();
 
-// Development tooling
-if (app.Environment.IsDevelopment())
+// Global exception handling, then the response headers every response carries.
+app.UseMiddleware<GlobalExceptionMiddleware>();
+app.UseMiddleware<SecurityHeadersMiddleware>();
+
+// Development tooling, off everywhere else unless explicitly enabled.
+if (SwaggerExposure.ShouldServe(app.Environment, app.Configuration))
 {
     app.UseSwagger();
     app.UseSwaggerUI();
@@ -287,6 +357,12 @@ if (app.Environment.IsDevelopment())
 
 // HTTP pipeline
 app.UseHttpsRedirection();
+
+// CORS answers preflights and stamps allowed origins on real responses.
+app.UseCors(CorsPolicyName);
+
+// Throttling sits after CORS so a rejected preflight is not itself throttled.
+app.UseMiddleware<RateLimitingMiddleware>();
 
 app.UseAuthentication();
 app.UseAuthorization();

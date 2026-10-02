@@ -6,9 +6,14 @@ using Api.Contracts.Responses;
 namespace Api.IntegrationTests;
 
 /// <summary>
-/// A registered user and the token that identifies them.
+/// A registered user and the credentials that identify them.
 /// </summary>
-public sealed record TestSession(Guid WorkspaceId, string AccessToken)
+public sealed record TestSession(
+    Guid WorkspaceId,
+    string AccessToken,
+    Guid UserId = default,
+    string RefreshToken = "",
+    string Email = "")
 {
     public static async Task<TestSession> RegisterAsync(
         HttpClient client,
@@ -29,7 +34,12 @@ public sealed record TestSession(Guid WorkspaceId, string AccessToken)
 
         TestHttp.EnsureSucceeded(response, body);
 
-        return new TestSession(body.WorkspaceId, body.AccessToken);
+        return new TestSession(
+            body.WorkspaceId,
+            body.AccessToken,
+            body.User.Id,
+            body.RefreshToken ?? string.Empty,
+            body.User.Email);
     }
 }
 

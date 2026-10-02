@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using Api.Application.Authentication;
 using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
 using Api.Application.ContentPillars;
@@ -7,6 +8,8 @@ using Api.Application.ContentPosts;
 using Api.Application.SocialAccounts;
 using Api.Contracts.Responses;
 using Api.Application.Analytics;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace Api.Middleware;
 
@@ -14,13 +17,16 @@ public class GlobalExceptionMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly ILogger<GlobalExceptionMiddleware> _logger;
+    private readonly JsonSerializerOptions _jsonOptions;
 
     public GlobalExceptionMiddleware(
         RequestDelegate next,
-        ILogger<GlobalExceptionMiddleware> logger)
+        ILogger<GlobalExceptionMiddleware> logger,
+        IOptions<JsonOptions> mvcJsonOptions)
     {
         _next = next;
         _logger = logger;
+        _jsonOptions = mvcJsonOptions.Value.JsonSerializerOptions;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -41,12 +47,36 @@ public class GlobalExceptionMiddleware
         }
     }
 
-    private static async Task HandleExceptionAsync(
+    private async Task HandleExceptionAsync(
         HttpContext context,
         Exception exception)
     {
         var (statusCode, code, message) = exception switch
         {
+            // Every refresh token failure is a 401. The codes stay distinct so a
+            // client can tell an expired token from a revoked one, and reuse
+            // from a benign retry of a request that lost a race.
+            InvalidRefreshTokenException refreshTokenException =>
+                (HttpStatusCode.Unauthorized, "INVALID_REFRESH_TOKEN",
+                    refreshTokenException.Message),
+            ExpiredRefreshTokenException refreshTokenException =>
+                (HttpStatusCode.Unauthorized, "REFRESH_TOKEN_EXPIRED",
+                    refreshTokenException.Message),
+            RevokedRefreshTokenException refreshTokenException =>
+                (HttpStatusCode.Unauthorized, "REFRESH_TOKEN_REVOKED",
+                    refreshTokenException.Message),
+            ReusedRefreshTokenException refreshTokenException =>
+                (HttpStatusCode.Unauthorized, "REFRESH_TOKEN_REUSED",
+                    refreshTokenException.Message),
+            RefreshTokenRotationConflictException refreshTokenException =>
+                (HttpStatusCode.Unauthorized, "REFRESH_TOKEN_ROTATION_CONFLICT",
+                    refreshTokenException.Message),
+            RefreshTokenOwnerInactiveException =>
+                (HttpStatusCode.Unauthorized, "ACCOUNT_INACTIVE",
+                    "This account is inactive."),
+            RefreshTokenWorkspaceAccessRevokedException refreshTokenException =>
+                (HttpStatusCode.Unauthorized, "REFRESH_TOKEN_WORKSPACE_ACCESS_REVOKED",
+                    refreshTokenException.Message),
             AiProviderUnavailableException =>
                 (HttpStatusCode.ServiceUnavailable, "AI_PROVIDER_UNAVAILABLE",
                     "The AI provider is currently unavailable."),
@@ -137,7 +167,9 @@ public class GlobalExceptionMiddleware
             TraceId = context.TraceIdentifier
         };
 
-        var json = JsonSerializer.Serialize(response);
+        // Serialized with the options MVC itself is configured with, so an error
+        // envelope cannot quietly differ in casing from every other response.
+        var json = JsonSerializer.Serialize(response, _jsonOptions);
 
         await context.Response.WriteAsync(json);
     }

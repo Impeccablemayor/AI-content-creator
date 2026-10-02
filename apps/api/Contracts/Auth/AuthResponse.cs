@@ -9,4 +9,6 @@ public sealed class AuthResponse
     public UserResponse User { get; init; } = new();
 
     public Guid WorkspaceId { get; init; }
+
+    public string RefreshToken { get; init; } = string.Empty;
 }

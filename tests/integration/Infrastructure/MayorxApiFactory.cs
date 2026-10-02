@@ -36,35 +36,124 @@ namespace Api.IntegrationTests;
 public sealed class MayorxApiFactory : WebApplicationFactory<Program>
 {
 private readonly string _adminConnectionString;
-private readonly string _testConnectionString;
-private readonly bool _ownsDatabase;
+    private readonly string _testConnectionString;
+    private readonly string _databaseName;
+    private readonly bool _ownsDatabase;
+private readonly IReadOnlyDictionary<string, string?> _settings;
 
-private bool _databaseCreated;
+    /// <summary>
+    /// The origin a test host is permitted to call from unless a test asks for
+    /// different ones.
+    /// </summary>
+    /// <remarks>
+    /// The API refuses to start outside Development when no allowed origin is
+    /// configured, which is the intended production behaviour. Test hosts run
+    /// with the environment set to Testing, so every one of them needs an origin,
+    /// and this is the one place that can supply it without each test class
+    /// inventing its own.
+    /// </remarks>
+    public const string DefaultAllowedOrigin = "https://app.test";
 
-public MayorxApiFactory()
-{
-    _adminConnectionString = IntegrationTestSettings.AdminConnectionString;
-    _testConnectionString = IntegrationTestSettings.TestConnectionString;
-    _ownsDatabase = true;
-}
+    /// <summary>
+    /// Connection string for the database this factory owns, for tests that need
+    /// to reach it outside the API, such as inspecting rows or changing privileges.
+    /// </summary>
+    public string TestConnectionString => _testConnectionString;
 
-private MayorxApiFactory(string testConnectionString)
-{
-    _adminConnectionString = IntegrationTestSettings.AdminConnectionString;
-    _testConnectionString = testConnectionString;
-    _ownsDatabase = false;
+    private bool _databaseCreated;
+    private string _environment = "Testing";
 
-    // Applied here rather than through Initialise, because a caller that asked for
-    // an unreachable host must not be able to forget to configure it.
-    ConfigureUnreachable();
-}
+    /// <summary>
+    /// Selects the hosting environment for this host, which is what decides
+    /// whether development-only surfaces such as Swagger are served.
+    /// </summary>
+    public void UseEnvironmentFor(string environment) => _environment = environment;
 
-/// <summary>
-/// Builds a host whose dependencies are unreachable. No database is created,
-/// because the point is that the container cannot be reached at all.
-/// </summary>
-public static MayorxApiFactory Unreachable(string databaseConnectionString) =>
-    new(databaseConnectionString);
+    public MayorxApiFactory()
+        : this(testConnectionString: null, settings: null)
+    {
+    }
+
+private MayorxApiFactory(
+        string? testConnectionString,
+        IReadOnlyDictionary<string, string?>? settings)
+    {
+        _adminConnectionString = IntegrationTestSettings.AdminConnectionString;
+
+        // One database per factory, not one per process. A test that needs a second
+        // host with different settings, which several of these do, would otherwise
+        // fight the first host over the same name. Kept short enough that PostgreSQL
+        // cannot silently truncate two different names into one.
+        _databaseName = $"mayorx_itest_{Guid.NewGuid():N}";
+
+        _testConnectionString = testConnectionString ?? BuildConnectionString(
+            IntegrationTestSettings.AdminConnectionString,
+            _databaseName);
+
+        _ownsDatabase = testConnectionString is null;
+        _settings = WithDefaultOrigin(settings);
+
+        if (testConnectionString is not null)
+        {
+            // Applied here rather than through Initialise, because a caller that
+            // asked for an unreachable host must not be able to forget it.
+            ConfigureUnreachable();
+        }
+    }
+
+    private static string BuildConnectionString(
+        string connectionString,
+        string database)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(connectionString);
+
+        builder.Database = database;
+
+        return builder.ConnectionString;
+    }
+
+    /// <summary>
+    /// Builds a factory that additionally overrides configuration for this run.
+    /// </summary>
+    /// <remarks>
+    /// Overrides are applied with <c>UseSetting</c> rather than environment
+    /// variables because environment variables are per process: one test class
+    /// setting a rate limit would otherwise be visible to whichever class happened
+    /// to build its host next. Host settings are scoped to this factory's host.
+    /// </remarks>
+    public static MayorxApiFactory WithSettings(
+        IReadOnlyDictionary<string, string?>? settings) =>
+        new(testConnectionString: null, settings);
+
+    /// <summary>
+    /// Builds a factory whose dependencies are unreachable. No database is created,
+    /// because the point is that the container cannot be reached at all.
+    /// </summary>
+    public static MayorxApiFactory Unreachable(string databaseConnectionString) =>
+        new(databaseConnectionString, settings: null);
+
+    /// <summary>
+    /// Returns the caller's settings, with a permitted origin added only when the
+    /// caller has not configured one. A test that supplies its own origins keeps
+    /// exactly those, so origin-matching behaviour can be asserted honestly.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string?> WithDefaultOrigin(
+        IReadOnlyDictionary<string, string?>? settings)
+    {
+        var effective = new Dictionary<string, string?>(
+            settings ?? new Dictionary<string, string?>());
+
+        var configured = effective.Keys.Any(key =>
+            key.StartsWith("Cors:AllowedOrigins", StringComparison.OrdinalIgnoreCase));
+
+        if (!configured)
+        {
+            effective["Cors:AllowedOrigins:0"] = DefaultAllowedOrigin;
+        }
+
+        return effective;
+    }
+
 
 /// <summary>
 /// A client that carries a bearer token. Each call returns a separate client over
@@ -144,7 +233,7 @@ private void CreateDatabase()
         connection.Open();
 
         using var command = connection.CreateCommand();
-        command.CommandText = $"CREATE DATABASE \"{IntegrationTestSettings.DatabaseName}\"";
+        command.CommandText = $"CREATE DATABASE \"{_databaseName}\"";
         command.ExecuteNonQuery();
 
         _databaseCreated = true;
@@ -152,10 +241,17 @@ private void CreateDatabase()
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment("Testing");
+        builder.UseEnvironment(_environment);
+
+        // Applied before the app reads its configuration, and scoped to this host.
+        foreach (var setting in _settings)
+        {
+            builder.UseSetting(setting.Key, setting.Value);
+        }
 
         builder.ConfigureServices(services =>
         {
+
             // The API deliberately does not register the scheduler or the publisher:
             // the worker host owns both. This test drives the same closed loop the
             // worker drives, so it registers them the way the worker does, by calling
@@ -241,9 +337,9 @@ private static void Set(string name, string value) =>
         using var connection = new NpgsqlConnection(_adminConnectionString);
         connection.Open();
 
-        using var command = connection.CreateCommand();
+using var command = connection.CreateCommand();
         command.CommandText =
-            $"DROP DATABASE IF EXISTS \"{IntegrationTestSettings.DatabaseName}\" WITH (FORCE)";
+            $"DROP DATABASE IF EXISTS \"{_databaseName}\" WITH (FORCE)";
         command.ExecuteNonQuery();
 
         _databaseCreated = false;

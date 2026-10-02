@@ -16,13 +16,16 @@ public sealed class AuthController : ControllerBase
 {
     private readonly AppDbContext _dbContext;
     private readonly JwtTokenService _jwtTokenService;
+    private readonly IRefreshTokenService _refreshTokenService;
 
     public AuthController(
         AppDbContext dbContext,
-        JwtTokenService jwtTokenService)
+        JwtTokenService jwtTokenService,
+        IRefreshTokenService refreshTokenService)
     {
         _dbContext = dbContext;
         _jwtTokenService = jwtTokenService;
+        _refreshTokenService = refreshTokenService;
     }
 
     [HttpPost("register")]
@@ -95,6 +98,11 @@ public sealed class AuthController : ControllerBase
                 user,
                 workspace.Id);
 
+        var refreshToken = await _refreshTokenService.IssueAsync(
+            user.Id,
+            workspace.Id,
+            cancellationToken);
+
         return Ok(new ApiResponse<AuthResponse>
         {
             Data = new AuthResponse
@@ -108,7 +116,8 @@ public sealed class AuthController : ControllerBase
                     Email = user.Email,
                     FirstName = user.FirstName,
                     LastName = user.LastName
-                }
+                },
+                RefreshToken = refreshToken
             },
             Message = "Account created successfully."
         });
@@ -178,6 +187,11 @@ public sealed class AuthController : ControllerBase
                 user,
                 membership.WorkspaceId);
 
+        var refreshToken = await _refreshTokenService.IssueAsync(
+            user.Id,
+            membership.WorkspaceId,
+            cancellationToken);
+
         return Ok(new ApiResponse<AuthResponse>
         {
             Data = new AuthResponse
@@ -191,9 +205,55 @@ public sealed class AuthController : ControllerBase
                     Email = user.Email,
                     FirstName = user.FirstName,
                     LastName = user.LastName
-                }
+                },
+                RefreshToken = refreshToken
             },
             Message = "Login successful."
+        });
+    }
+
+    [HttpPost("refresh")]
+    public async Task<IActionResult> Refresh(
+        RefreshTokenRequest request,
+        CancellationToken cancellationToken)
+    {
+        var session = await _refreshTokenService.RefreshAsync(
+            request.RefreshToken,
+            cancellationToken);
+
+        return Ok(new ApiResponse<AuthResponse>
+        {
+            Data = new AuthResponse
+            {
+                AccessToken = session.AccessToken,
+                ExpiresAt = session.AccessTokenExpiresAt,
+                WorkspaceId = session.WorkspaceId,
+                User = new UserResponse
+                {
+                    Id = session.UserId,
+                    Email = session.Email,
+                    FirstName = session.FirstName,
+                    LastName = session.LastName
+                },
+                RefreshToken = session.RefreshToken
+            },
+            Message = "Token refreshed successfully."
+        });
+    }
+
+    [HttpPost("logout")]
+    public async Task<IActionResult> Logout(
+        RefreshTokenRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _refreshTokenService.RevokeAsync(
+            request.RefreshToken,
+            cancellationToken);
+
+        return Ok(new ApiResponse<object>
+        {
+            Data = new { },
+            Message = "Logged out successfully."
         });
     }
 }

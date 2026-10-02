@@ -163,17 +163,27 @@ public sealed class AnalyticsEndpointTests
 
         var middleware = new GlobalExceptionMiddleware(
             _ => throw new InvalidAnalyticsPeriodException(),
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<GlobalExceptionMiddleware>.Instance);
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<GlobalExceptionMiddleware>.Instance,
+            Microsoft.Extensions.Options.Options.Create(
+                new Microsoft.AspNetCore.Mvc.JsonOptions()));
 
         await middleware.InvokeAsync(context);
 
         context.Response.Body.Position = 0;
         var payload = new StreamReader(context.Response.Body).ReadToEnd();
-        var parsed = System.Text.Json.JsonSerializer.Deserialize<ApiErrorResponse>(payload)!;
+
+        // Read as raw JSON rather than deserialized, because the property casing
+        // is part of what this asserts: the error envelope has to look the same
+        // to a client as every other response the API returns.
+        using var document = System.Text.Json.JsonDocument.Parse(payload);
+        var error = document.RootElement.GetProperty("error");
 
         Assert.Equal(400, context.Response.StatusCode);
-        Assert.Equal("INVALID_ANALYTICS_PERIOD", parsed.Error.Code);
-        Assert.NotEqual(string.Empty, parsed.TraceId);
+        Assert.Equal("INVALID_ANALYTICS_PERIOD", error.GetProperty("code").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(payload));
+        Assert.NotEqual(
+            string.Empty,
+            document.RootElement.GetProperty("traceId").GetString());
     }
 
     private static readonly DateTime Anchor = new(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc);

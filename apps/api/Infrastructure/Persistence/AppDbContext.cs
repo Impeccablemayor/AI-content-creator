@@ -25,6 +25,7 @@ public sealed class AppDbContext : DbContext
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<AiRun> AiRuns => Set<AiRun>();
     public DbSet<LearningSignal> LearningSignals => Set<LearningSignal>();
+    public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -565,6 +566,53 @@ public sealed class AppDbContext : DbContext
                 .WithOne(x => x.AudienceProfile)
                 .HasForeignKey<AudienceProfile>(x => x.WorkspaceId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+        modelBuilder.Entity<RefreshToken>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+
+            // The lookup path for every refresh. Unique, so two issued tokens
+            // can never collide onto one row.
+            entity.HasIndex(x => x.TokenHash)
+                .IsUnique();
+
+            // Session-wide revocation walks the replacement chain within one
+            // user and workspace, so this serves the traversal.
+            entity.HasIndex(x => new { x.UserId, x.WorkspaceId, x.Id });
+
+            // Reclaiming rows that no longer authenticate anything.
+            entity.HasIndex(x => x.ExpiresAt);
+
+            // Base64 SHA-256 is 44 characters; 64 leaves room without pretending
+            // the column holds something larger.
+            entity.Property(x => x.TokenHash)
+                .HasMaxLength(64)
+                .IsRequired();
+
+            entity.Property(x => x.Status)
+                .HasConversion<string>()
+                .HasMaxLength(50)
+                .IsRequired();
+
+            entity.Property(x => x.RevocationReason)
+                .HasMaxLength(200);
+
+            entity.HasOne(x => x.User)
+                .WithMany()
+                .HasForeignKey(x => x.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(x => x.Workspace)
+                .WithMany()
+                .HasForeignKey(x => x.WorkspaceId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            // Restrict: the chain must not be collapsed by deleting a row out of
+            // the middle of it, which would erase the evidence of a replay.
+            entity.HasOne<RefreshToken>()
+                .WithMany()
+                .HasForeignKey(x => x.ReplacedById)
+                .OnDelete(DeleteBehavior.Restrict);
         });
     }
 }
