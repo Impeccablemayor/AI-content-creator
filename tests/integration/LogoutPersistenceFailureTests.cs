@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -20,7 +19,7 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
 {
     private readonly MayorxApiFactory _factory;
 
-    private HttpClient _client = null!;
+    private BrowserClient _browser = null!;
 
     public LogoutPersistenceFailureTests()
     {
@@ -38,12 +37,12 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
         _factory.Initialise();
         await _factory.MigrateAsync();
 
-        _client = _factory.CreateClient();
+        _browser = new BrowserClient(_factory);
     }
 
     public Task DisposeAsync()
     {
-        _client?.Dispose();
+        _browser?.Dispose();
         _factory.Dispose();
 
         return Task.CompletedTask;
@@ -52,7 +51,7 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
     [Fact]
     public async Task Logout_reports_a_failure_rather_than_claiming_success()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout-fail");
+        var session = await TestSession.RegisterAsync(_browser, "logout-fail");
 
         Assert.True(await IsActiveAsync(session));
 
@@ -60,9 +59,7 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
 
         try
         {
-            using var response = await _client.PostAsJsonAsync(
-                "api/v1/auth/logout",
-                new { refreshToken = session.RefreshToken });
+            using var response = await LogoutAsync();
 
             // Reporting 200 here would tell the user their session is closed
             // while the token is still usable, which is the worst possible
@@ -92,15 +89,13 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
     [Fact]
     public async Task A_failed_logout_leaves_the_token_exactly_as_it_was()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout-fail-state");
+        var session = await TestSession.RegisterAsync(_browser, "logout-fail-state");
 
         await BreakRefreshTokenUpdatesAsync();
 
         try
         {
-            using var response = await _client.PostAsJsonAsync(
-                "api/v1/auth/logout",
-                new { refreshToken = session.RefreshToken });
+            using var response = await LogoutAsync();
 
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
 
@@ -124,15 +119,13 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
     [Fact]
     public async Task The_token_still_works_once_logout_can_reach_the_database_again()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout-recover");
+        var session = await TestSession.RegisterAsync(_browser, "logout-recover");
 
         await BreakRefreshTokenUpdatesAsync();
 
         try
         {
-            using var refused = await _client.PostAsJsonAsync(
-                "api/v1/auth/logout",
-                new { refreshToken = session.RefreshToken });
+            using var refused = await LogoutAsync();
 
             Assert.Equal(HttpStatusCode.InternalServerError, refused.StatusCode);
         }
@@ -143,14 +136,20 @@ public sealed class LogoutPersistenceFailureTests : IAsyncLifetime
 
         // The token was never revoked, so rotating it proves the failed logout
         // did not damage the session.
-        using var refresh = await _client.PostAsJsonAsync(
-            "api/v1/auth/refresh",
-            new { refreshToken = session.RefreshToken });
+        using var refresh = await _browser.PostAsync("api/v1/auth/refresh");
 
         Assert.Equal(HttpStatusCode.OK, refresh.StatusCode);
     }
 
-    // ---------------------------------------------------------------- helpers
+// ---------------------------------------------------------------- helpers
+
+    /// <summary>
+    /// Logout with no body at all. The refresh token is in the cookie the
+    /// registration left on this browser, which is exactly where a browser keeps
+    /// it.
+    /// </summary>
+    private Task<HttpResponseMessage> LogoutAsync() =>
+        _browser.PostAsync("api/v1/auth/logout");
 
     private async Task<bool> IsActiveAsync(TestSession session)
     {

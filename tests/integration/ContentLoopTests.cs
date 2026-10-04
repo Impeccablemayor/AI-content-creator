@@ -30,7 +30,7 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
 {
     private readonly MayorxApiFactory _factory;
 
-    private HttpClient _client = null!;
+    private BrowserClient _browser = null!;
 
     public ContentLoopTests(MayorxApiFactory factory)
     {
@@ -44,12 +44,12 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
         _factory.Initialise();
         await _factory.MigrateAsync();
 
-        _client = _factory.CreateClient();
+        _browser = new BrowserClient(_factory);
     }
 
     public Task DisposeAsync()
     {
-        _client?.Dispose();
+        _browser?.Dispose();
 
         return Task.CompletedTask;
     }
@@ -57,8 +57,12 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
     [Fact]
     public async Task Scheduled_post_flows_through_publishing_metrics_reporting_and_learning()
     {
-        var session = await TestSession.RegisterAsync(_client, "loop");
-        using var authenticated = _factory.CreateAuthenticatedClient(session.AccessToken);
+        var session = await TestSession.RegisterAsync(_browser, "loop");
+
+        // Already authenticated: the registration set the session cookies on
+        // this client. Nothing is added to it by hand, because the cookie is the
+        // credential, exactly as it is in a browser.
+        var authenticated = _browser;
 
         var posts = await SeedTwoDraftPostsAsync(session.WorkspaceId);
 
@@ -67,13 +71,12 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
         foreach (var post in posts)
         {
             var approved = await authenticated.PostAsync(
-                $"api/v1/content-posts/{post.Id}/approve",
-                content: null);
+                $"api/v1/content-posts/{post.Id}/approve");
             TestHttp.EnsureSucceeded(
                 approved,
                 await TestHttp.ReadAsync<ContentPostResponse>(approved));
 
-            var scheduled = await authenticated.PostAsJsonAsync(
+            var scheduled = await authenticated.PostAsync(
                 $"api/v1/content-posts/{post.Id}/schedule",
                 new { scheduledAt = DateTimeOffset.UtcNow.AddHours(1) });
             TestHttp.EnsureSucceeded(
@@ -124,9 +127,7 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
         // separate. Both posts share a platform, a pillar, and a publish day, which
         // leaves content type as the one dimension with two groups.
         var run = await TestHttp.ReadAsync<LearningInsightsRunResponse>(
-            await authenticated.PostAsync(
-                "api/v1/learning/insights",
-                content: null));
+            await authenticated.PostAsync("api/v1/learning/insights"));
 
         Assert.True(run.HasSufficientData);
         Assert.Equal(posts.Count, run.MeasuredPosts);
@@ -166,11 +167,15 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
     [Fact]
     public async Task One_workspace_cannot_read_another_workspaces_performance_or_signals()
     {
-        var owner = await TestSession.RegisterAsync(_client, "owner");
-        var stranger = await TestSession.RegisterAsync(_client, "stranger");
+        // One client per identity. Sharing a single client would leave the second
+        // registration's cookies as the only session on it, and every later
+        // assertion about the first user would quietly be an assertion about
+        // the second.
+        using var ownerClient = new BrowserClient(_factory);
+        using var strangerClient = new BrowserClient(_factory);
 
-        using var ownerClient = _factory.CreateAuthenticatedClient(owner.AccessToken);
-        using var strangerClient = _factory.CreateAuthenticatedClient(stranger.AccessToken);
+        var owner = await TestSession.RegisterAsync(ownerClient, "owner");
+        var stranger = await TestSession.RegisterAsync(strangerClient, "stranger");
 
         var posts = await SeedTwoDraftPostsAsync(owner.WorkspaceId);
         await ApproveAndScheduleAsync(ownerClient, posts);
@@ -179,7 +184,7 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
         await _factory.RunScheduledPostProcessorAsync();
         await _factory.RunAnalyticsSyncAsync();
 
-        await ownerClient.PostAsync("api/v1/learning/insights", content: null);
+        await ownerClient.PostAsync("api/v1/learning/insights");
 
         var ownerAnalytics = await TestHttp.ReadAsync<List<PostAnalyticsResponse>>(
             await ownerClient.GetAsync("api/v1/analytics/posts"));
@@ -190,7 +195,7 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
         Assert.Empty(strangerAnalytics);
 
         var strangerRun = await TestHttp.ReadAsync<LearningInsightsRunResponse>(
-            await strangerClient.PostAsync("api/v1/learning/insights", content: null));
+            await strangerClient.PostAsync("api/v1/learning/insights"));
 
         Assert.False(strangerRun.HasSufficientData);
         Assert.Empty(strangerRun.Insights);
@@ -210,7 +215,7 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
     [Fact]
     public async Task Unauthenticated_requests_are_rejected_and_still_get_a_correlation_id()
     {
-        using var response = await _client.GetAsync("api/v1/analytics/posts");
+        using var response = await _browser.GetAsync("api/v1/analytics/posts");
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
 
@@ -343,17 +348,16 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
     }
 
     private static async Task ApproveAndScheduleAsync(
-        HttpClient client,
+        BrowserClient client,
         IReadOnlyList<ContentPost> posts)
     {
         foreach (var post in posts)
         {
             var approved = await client.PostAsync(
-                $"api/v1/content-posts/{post.Id}/approve",
-                content: null);
+                $"api/v1/content-posts/{post.Id}/approve");
             TestHttp.EnsureSucceeded(approved);
 
-            var scheduled = await client.PostAsJsonAsync(
+            var scheduled = await client.PostAsync(
                 $"api/v1/content-posts/{post.Id}/schedule",
                 new { scheduledAt = DateTimeOffset.UtcNow.AddHours(1) });
             TestHttp.EnsureSucceeded(scheduled);

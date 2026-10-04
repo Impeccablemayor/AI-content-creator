@@ -141,6 +141,24 @@ builder.Services.AddSwaggerGen(options =>
         In = ParameterLocation.Header,
         Description = "JWT bearer access token."
     });
+
+    // How a browser actually authenticates. The cookie is documented rather
+    // than the header alone, because a generated client built only from the
+    // header would push a token into JavaScript and reintroduce exactly what the
+    // cookie avoids.
+    options.AddSecurityDefinition(
+        AuthCookieOptions.OpenApiSecuritySchemeName,
+        new OpenApiSecurityScheme
+        {
+            Name = AuthCookieOptions.DefaultAccessTokenCookieName,
+            Type = SecuritySchemeType.ApiKey,
+            In = ParameterLocation.Cookie,
+            Description =
+                "httpOnly session cookie set by register, login, refresh, " +
+                "workspace create, and workspace switch. Sent automatically " +
+                "by the browser; page script cannot read it."
+        });
+
     options.OperationFilter<AuthorizeOperationFilter>();
 });
 // The readiness checks run against the dependencies the API cannot serve traffic
@@ -188,6 +206,41 @@ var jwtOptions = builder.Configuration
     ?? throw new InvalidOperationException(
         "JWT configuration is missing.");
 
+// The browser session is an httpOnly cookie pair. Whether those cookies carry
+// Secure and which SameSite they need is a property of the deployed topology,
+// not of this code, so it is configuration with a safe default rather than a
+// constant chosen here.
+var authCookieSection = builder.Configuration
+    .GetSection(AuthCookieOptions.SectionName);
+
+builder.Services
+    .AddOptions<AuthCookieOptions>()
+    .Bind(authCookieSection)
+    .PostConfigure(options =>
+    {
+        // Configuration is consulted for the environment-sensitive default
+        // because it cannot live in the options object: it depends on which
+        // environment the host is in. The rule itself lives on the options type
+        // so it can be asserted directly.
+        options.Secure = AuthCookieOptions.ResolveSecure(
+            authCookieSection[nameof(AuthCookieOptions.Secure)]
+                is string configured && bool.TryParse(configured, out var parsed)
+                    ? parsed
+                    : null,
+            builder.Environment.IsDevelopment());
+    })
+    // A browser silently discards SameSite=None without Secure, so a deployment
+    // that asked for it would appear to work in the API's own logs and fail for
+    // every real user. Refusing to start names the problem instead.
+    .Validate(
+        options => options.HasAcceptableSameSiteConfiguration(),
+        "AuthCookies:SameSite=None requires AuthCookies:Secure=true, because " +
+        "browsers reject a SameSite=None cookie that is not Secure.")
+    .Validate(
+        options => options.HasRequiredCookieNames(),
+        "Both AuthCookies cookie names are required.")
+    .ValidateOnStart();
+
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
@@ -206,6 +259,45 @@ builder.Services
                 Encoding.UTF8.GetBytes(jwtOptions.SecretKey)),
 
             ClockSkew = TimeSpan.FromSeconds(30)
+        };
+
+        // A browser sends the access token in a cookie instead of a header,
+        // because the only way to keep it out of reach of page script is to
+        // never hand it to page script. Validation is untouched: it is the same
+        // token, the same issuer, the same audience, and the same signing key.
+        //
+        // A header that is present is left alone. The header is what a
+        // non-browser client sends, and quietly preferring the cookie would let
+        // a stale cookie override a token the caller deliberately supplied.
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                if (string.IsNullOrEmpty(context.Token) &&
+                    context.Request.Headers.ContainsKey(
+                        "Authorization"))
+                {
+                    return Task.CompletedTask;
+                }
+
+                if (string.IsNullOrEmpty(context.Token))
+                {
+                    var cookieValue = context.HttpContext.Request.Cookies[
+                        context.HttpContext.RequestServices
+                            .GetRequiredService<
+                                Microsoft.Extensions.Options
+                                    .IOptions<AuthCookieOptions>>()
+                            .Value
+                            .AccessTokenCookieName];
+
+                    if (!string.IsNullOrWhiteSpace(cookieValue))
+                    {
+                        context.Token = cookieValue;
+                    }
+                }
+
+                return Task.CompletedTask;
+            }
         };
     });
 
@@ -298,6 +390,7 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<CurrentUserService>();
 builder.Services.AddScoped<JwtTokenService>();
 builder.Services.AddScoped<IRefreshTokenService, RefreshTokenService>();
+builder.Services.AddScoped<IAuthCookieService, AuthCookieService>();
 builder.Services.AddScoped<IContentIdeaService, ContentIdeaService>();
 builder.Services.AddScoped<IContentPillarService, ContentPillarService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();

@@ -526,6 +526,54 @@ The frontend has the final application shell and can navigate between the major 
 
 Establish secure user identity and multi-tenant workspace isolation.
 
+## Implementation status
+
+**Status: backend delivered.** The browser auth contract and the workspace
+session contract are implemented and covered by integration tests.
+
+| Capability | Status |
+| --- | --- |
+| Registration, creating the caller's first workspace as `Owner` | Implemented |
+| Login, opening a session | Implemented |
+| Refresh, with rotation, reuse detection, and workspace binding | Implemented |
+| Logout, revoking the session and deleting the cookies | Implemented |
+| `GET /users/me` | Implemented |
+| `GET /workspaces` — the caller's own memberships only | Implemented |
+| `POST /workspaces` — creates, owns, and switches to a new workspace | Implemented |
+| `POST /workspaces/{workspaceId}/switch` — membership-checked, reissues the session | Implemented |
+| `GET /workspaces/current`, `PATCH /workspaces/current` | Implemented |
+| Session in `HttpOnly` cookies, no token in any response body | Implemented |
+| Workspace selected by the session's `workspace_id` claim, not a request header | Implemented |
+| No `GET /workspaces/{workspaceId}`, `PATCH`, or `DELETE` | Deliberate; see below |
+| Password management (forgot/reset), user profile editing | Not implemented |
+| Workspace member management endpoints | Not implemented |
+| Frontend: `/login`, `/register`, `/onboarding`, workspace switcher | Not started |
+
+### The session is the workspace
+
+There is no workspace id on any request. Login picks the workspace
+deterministically (oldest membership, lowest membership id on a tie), embeds it
+as a `workspace_id` claim, and every read and write is scoped to that claim.
+Switching is the only way to change it, and it checks membership first.
+
+This is why there is no route taking a workspace id: such a route would accept
+a workspace name from the caller, and the whole point is that the set of
+workspaces a request may touch is decided by who the caller is, not by what
+they typed.
+
+### Why cookies
+
+Both credentials are `HttpOnly` cookies and neither appears in a response body.
+A token in a body is a token page script can read, so it can be exfiltrated by
+any script that runs on the page and survives in `localStorage` where an XSS
+read can take it. The `Authorization` header is still accepted for non-browser
+clients, and is validated identically.
+
+Defaults assume the web app and API share a site: `SameSite=Lax`, `Secure`
+outside Development. A cross-site deployment sets `AuthCookies:SameSite=None`
+with `AuthCookies:Secure=true`; the API refuses to start with `None` and
+`Secure=false`, because browsers reject that combination silently.
+
 ## Backend
 
 Implement:
@@ -562,13 +610,15 @@ Implement:
 
 Create workspace selection and workspace context.
 
-The frontend should send:
+The frontend does **not** send a workspace id on requests. The session carries
+it: login returns the workspace the session is scoped to, the frontend shows a
+switcher built from `GET /workspaces`, and choosing one calls
+`POST /workspaces/{workspaceId}/switch` to open a session there.
 
-```http
-X-Workspace-Id
-```
-
-for workspace-scoped requests where required.
+The frontend also never sees a token. Authentication is two `HttpOnly` cookies,
+so credentials cannot be read by page script, stored in `localStorage`, or
+attached by hand. A refresh happens by posting `/auth/refresh` with no body and
+letting the browser send its cookie.
 
 ## Security requirements
 
@@ -578,6 +628,12 @@ Every workspace-scoped endpoint must verify:
 2. Workspace membership.
 3. Required role.
 4. Resource ownership where applicable.
+
+Membership and role are not re-checked per request because there is no workspace
+to check them against: the session already names one, and it was checked when
+the session was issued. Resource ownership is checked on every read, so a post
+or account belonging to another workspace reads as not found even though the
+caller is authenticated.
 
 ## Deliverable
 

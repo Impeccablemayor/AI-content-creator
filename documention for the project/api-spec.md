@@ -121,33 +121,108 @@ Typical authentication flow:
 ```text
 Login
   ↓
-Access Token + Refresh Token
+HttpOnly session cookies (mayorx.at, mayorx.rt)
   ↓
 API Requests
   ↓
 Access Token Expires
   ↓
-Refresh Token
+POST /auth/refresh with the refresh cookie
   ↓
-New Access Token
+Rotated cookies
+```
+
+### Session cookies
+
+A browser session lives entirely in two `HttpOnly` cookies. Neither credential
+appears in any response body, so page script can neither read nor exfiltrate
+them:
+
+| Cookie | Holds | Lifetime |
+| --- | --- | --- |
+| `mayorx.at` | JWT access token | `Jwt:ExpirationMinutes` (default 60) |
+| `mayorx.rt` | Refresh token | `Jwt:RefreshTokenExpirationDays` (default 7) |
+
+Both are written with `Path=/`, `HttpOnly`, `Secure` (default on outside
+Development), and `SameSite=Lax`.
+
+Every one of these is a default held in code (`AuthCookieOptions`), not a value
+in `appsettings.json`, so a deployment that configures nothing gets exactly the
+behaviour below. The full set, all optional:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `AuthCookies:AccessTokenCookieName` | `mayorx.at` | Must be non-blank |
+| `AuthCookies:RefreshTokenCookieName` | `mayorx.rt` | Must be non-blank |
+| `AuthCookies:Path` | `/` | So any route in the app can be authenticated |
+| `AuthCookies:Domain` | *(empty)* | Empty means host-only, which is the safe choice |
+| `AuthCookies:SameSite` | `Lax` | See the cross-site note below |
+| `AuthCookies:Secure` | `true` outside Development | Cannot be a static value; derived from the hosting environment |
+
+> **Why `AuthCookies` is absent from `appsettings.json`.** The `Secure` default
+> depends on the environment, so it cannot live in a settings file. The API reads
+> it only when configuration is silent on the key, which means adding
+> `"AuthCookies": { "Secure": true }` to `appsettings.json` would not document
+> the default — it would replace it in every environment, including Development,
+> where the API is served over plain HTTP and the cookie would never be sent
+> back. Leave the section absent unless a deployment genuinely needs to
+> override something.
+
+> **Cross-site deployments.** The defaults assume the web app and the API share
+> a site. If the web app is served from a different site to the API, browsers
+> require `SameSite=None` together with `Secure`, so set
+> `AuthCookies:SameSite=None` and `AuthCookies:Secure=true`, and add the web
+> origin to `Cors:AllowedOrigins`. The API refuses to start with
+> `SameSite=None` and `Secure=false`, because browsers silently reject such a
+> cookie and every user would stay logged out. A cross-site deployment must also
+> add its own CSRF defence: with `SameSite=None` a cross-site request carries the
+> cookie automatically, so the cookie alone no longer implies the request was
+> same-site.
+
+### Response shape
+
+`POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`,
+`POST /workspaces`, and `POST /workspaces/{workspaceId}/switch` all return the
+same body, and it carries no tokens:
+
+```json
+{
+  "data": {
+    "user": {
+      "id": "uuid",
+      "email": "user@example.com",
+      "firstName": "Mayowa",
+      "lastName": "Binuyo"
+    },
+    "workspaceId": "uuid",
+    "expiresAt": "2026-09-25T18:45:00Z"
+  },
+  "message": "Login successful"
+}
 ```
 
 ---
 
-## 5.2 Authorization Header
+## 5.2 Presenting the credential
 
-Authenticated requests use:
+Authenticated requests use the session cookie:
 
 ```http
-Authorization: Bearer <access_token>
+Cookie: mayorx.at=eyJ...
 ```
 
 Example:
 
 ```http
 GET /api/v1/workspaces
-Authorization: Bearer eyJ...
+Cookie: mayorx.at=eyJ...
 ```
+
+A bearer `Authorization` header is still accepted and is validated identically.
+It is used by non-browser clients such as the CLI, and by the integration tests
+that need to present one exact credential. When a request carries an
+`Authorization` header, that token wins; the cookie is only read when the header
+is absent.
 
 ---
 
@@ -155,7 +230,7 @@ Authorization: Bearer eyJ...
 
 ## POST `/auth/register`
 
-Creates a user account.
+Creates a user account and the caller's first workspace.
 
 ### Request
 
@@ -170,6 +245,8 @@ Creates a user account.
 
 ### Response
 
+Sets `mayorx.at` and `mayorx.rt`, and returns:
+
 ```json
 {
   "data": {
@@ -178,7 +255,9 @@ Creates a user account.
       "email": "user@example.com",
       "firstName": "Mayowa",
       "lastName": "Binuyo"
-    }
+    },
+    "workspaceId": "uuid",
+    "expiresAt": "2026-09-25T18:45:00Z"
   },
   "message": "Account created successfully"
 }
@@ -190,7 +269,12 @@ Creates a user account.
 
 ## POST `/auth/login`
 
-Authenticates a user.
+Authenticates a user and opens a session.
+
+The workspace the session is scoped to is chosen deterministically: the
+membership with the oldest `JoinedAt`, and on a tie the lowest membership id.
+The result is reproducible across logins rather than depending on the order the
+database happens to return rows in.
 
 ### Request
 
@@ -203,18 +287,19 @@ Authenticates a user.
 
 ### Response
 
+Sets `mayorx.at` and `mayorx.rt`, and returns:
+
 ```json
 {
   "data": {
-    "accessToken": "jwt-token",
-    "refreshToken": "refresh-token",
-    "expiresIn": 900,
     "user": {
       "id": "uuid",
       "email": "user@example.com",
       "firstName": "Mayowa",
       "lastName": "Binuyo"
-    }
+    },
+    "workspaceId": "uuid",
+    "expiresAt": "2026-09-25T18:45:00Z"
   },
   "message": "Login successful"
 }
@@ -226,42 +311,54 @@ Authenticates a user.
 
 ## POST `/auth/refresh`
 
-Generates a new access token.
-
-### Request
-
-```json
-{
-  "refreshToken": "refresh-token"
-}
-```
+Rotates the session. Takes no request body: the refresh token is read from the
+`mayorx.rt` cookie.
 
 ### Response
+
+Sets a new `mayorx.at` and a new `mayorx.rt`. The presented token is revoked,
+so it cannot be used again.
 
 ```json
 {
   "data": {
-    "accessToken": "new-jwt-token",
-    "refreshToken": "new-refresh-token",
-    "expiresIn": 900
+    "user": {
+      "id": "uuid",
+      "email": "user@example.com",
+      "firstName": "Mayowa",
+      "lastName": "Binuyo"
+    },
+    "workspaceId": "uuid",
+    "expiresAt": "2026-09-25T19:00:00Z"
   },
   "message": "Token refreshed successfully"
 }
 ```
 
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `401` | `REFRESH_TOKEN_INVALID` | Unknown, expired, or already revoked token |
+| `401` | `REFRESH_TOKEN_REUSED` | An already-consumed token was presented; the whole session is revoked |
+| `403` | `WORKSPACE_ACCESS_DENIED` | The membership behind the token no longer exists |
+
+A failed refresh also expires the refresh cookie, so a browser is not left
+holding a credential the server has already rejected.
+
 ---
 
 ## POST `/auth/logout`
 
-Invalidates the current refresh session.
+Revokes the current refresh session and deletes both cookies. Takes no request
+body.
 
-**Status:** `204 No Content`
+**Status:** `200 OK`
 
 ---
 
-## GET `/auth/me`
+## GET `/users/me`
 
-Returns the currently authenticated user.
+Returns the currently authenticated user. See §16 — the authenticated caller is
+a user, so this sits under `/users` rather than under `/auth`.
 
 ### Response
 
@@ -284,19 +381,43 @@ Mayorx Content Engine is designed to support multiple workspaces.
 
 Most authenticated resources belong to a workspace.
 
-The workspace can be supplied through:
+**The workspace comes from the session, not from the request.** There is no
+`X-Workspace-Id` header and no workspace id in request bodies. Every successful
+authentication embeds a `workspace_id` claim in the access token, and the API
+scopes every read and write to that claim. A caller cannot address another
+workspace by guessing an identifier, because there is no request field to guess
+into; membership is enforced when the session is issued, and again on every
+switch.
+
+To move between workspaces, call `POST /workspaces/{workspaceId}/switch`. That
+checks membership and issues a new session scoped to the target workspace,
+including a refresh token bound to it.
 
 ```http
-X-Workspace-Id: <workspace_uuid>
+POST /api/v1/workspaces/4d4c0b7c-.../switch
+Cookie: mayorx.at=eyJ...
 ```
 
-Example:
-
-```http
-X-Workspace-Id: 4d4c0b7c-...
+```json
+{
+  "data": {
+    "user": {
+      "id": "uuid",
+      "email": "user@example.com",
+      "firstName": "Mayowa",
+      "lastName": "Binuyo"
+    },
+    "workspaceId": "4d4c0b7c-...",
+    "expiresAt": "2026-09-25T18:45:00Z"
+  },
+  "message": "Workspace switched successfully"
+}
 ```
 
-The backend must verify that the authenticated user is a member of the requested workspace.
+Switching to a workspace the caller is not a member of returns
+`403 WORKSPACE_ACCESS_DENIED`. Refused rather than `404`: the caller is
+authenticated, so hiding the workspace's existence would be a false answer
+rather than a safer one.
 
 ---
 
@@ -512,81 +633,146 @@ Updates the current user's profile.
 
 # 17. Workspaces
 
+The workspace a request operates on is the one in the caller's session (see
+§7). These endpoints are how a caller discovers the workspaces they belong to,
+adds one, and changes which one they are working in.
+
 ## GET `/workspaces`
 
-Returns workspaces accessible to the authenticated user.
+Returns the workspaces the authenticated user is a member of, oldest membership
+first and lowest membership id on a tie — the same order login uses.
+
+```json
+{
+  "data": [
+    {
+      "id": "uuid",
+      "name": "Mayorx Tech",
+      "status": "Active",
+      "role": "Owner",
+      "isCurrent": true
+    }
+  ],
+  "message": "Workspaces retrieved successfully."
+}
+```
+
+The set comes from the caller's own membership rows, so there is no request
+parameter that could widen it.
 
 ---
 
 ## POST `/workspaces`
 
-Creates a workspace.
+Creates a workspace, makes the caller its `Owner`, and opens a session scoped to
+it. The previous workspace is untouched; the user is a member of both, and
+switching back is the same call they would make anyway.
 
 ### Request
 
 ```json
 {
-  "name": "Mayorx Tech",
-  "slug": "mayorx-tech"
+  "name": "Mayorx Tech"
 }
 ```
 
+### Response
+
+Sets `mayorx.at` and `mayorx.rt`, and returns the same session body as login,
+with `workspaceId` set to the new workspace. `Location` points at
+`/workspaces/current`.
+
 **Status:** `201 Created`
 
----
-
-## GET `/workspaces/{workspaceId}`
-
-Returns workspace details.
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `INVALID_WORKSPACE_NAME` | `name` is missing or blank |
 
 ---
 
-## PATCH `/workspaces/{workspaceId}`
+## POST `/workspaces/{workspaceId}/switch`
 
-Updates workspace details.
+Moves the session to a workspace the caller is a member of. Issues new cookies
+including a refresh token bound to the target workspace, so a later refresh
+cannot fall back to the workspace the session left.
+
+**Status:** `200 OK`
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `403` | `WORKSPACE_ACCESS_DENIED` | Not a member of that workspace |
+
+A workspace that does not exist returns the **same** `403`, not a `404`.
+Distinguishing the two would let any authenticated caller enumerate which
+workspace identifiers exist in the system by watching which code came back, so
+a caller who is not a member cannot learn whether the workspace they named is
+someone else's or imaginary. The two cases are resolved by one query and one
+response.
 
 ---
 
-## DELETE `/workspaces/{workspaceId}`
+---
 
-Deletes or archives a workspace according to retention rules.
+## GET `/workspaces/current`
 
-**Required role:** `Owner`
+Returns the workspace the caller's session is scoped to.
+
+---
+
+## PATCH `/workspaces/current`
+
+Updates the current workspace's details.
+
+---
+
+### Not implemented
+
+`GET /workspaces/{workspaceId}`, `PATCH /workspaces/{workspaceId}` and
+`DELETE /workspaces/{workspaceId}` are not implemented. There is deliberately no
+route that takes a workspace id, because a caller must not be able to name a
+workspace they do not belong to — `current` and `switch` are the only ways in,
+and both check membership.
 
 ---
 
 # 18. Workspace Members
 
-## GET `/workspaces/{workspaceId}/members`
+> **Out of scope. Not implemented.** No member-management route exists in this
+> API, and none is planned as part of the browser session contract. Nothing
+> below describes behaviour you can call.
+>
+> Membership is currently created in exactly two places: by registration, which
+> makes the caller the `Owner` of their first workspace, and by
+> `POST /workspaces`, which makes the caller the `Owner` of each workspace they
+> create. There is no way for one user to add another.
+>
+> The routes that would eventually provide it are deliberately **not** named as
+> endpoints, because §17 states there is deliberately no route taking a
+> workspace id. Adding member management means revisiting that decision first:
+> a member route has to identify which workspace it is administering, and it
+> cannot do so from the session the way a `current` route does, because an
+> `Owner` may administer several workspaces from one session.
 
-Returns workspace members.
+## What is not available
 
----
+For reference, the operations a member-management feature would eventually
+need. **These are requirements, not endpoints** — do not build a client against
+them.
 
-## POST `/workspaces/{workspaceId}/members`
+| Operation | Purpose |
+| --- | --- |
+| List members of a workspace | Show who has access |
+| Invite a member by email | Grant access to someone else |
+| Change a member's role | Promote or demote |
+| Remove a member | Revoke access |
 
-Adds/invites a member.
+The same tenant rules apply to all of them when they are built: the caller must
+be a member of the target workspace, a caller may never name a workspace they
+do not belong to, and the target workspace is resolved from the caller's
+membership rather than trusted from the request.
 
-### Request
-
-```json
-{
-  "email": "editor@example.com",
-  "role": "Editor"
-}
-```
-
----
-
-## PATCH `/workspaces/{workspaceId}/members/{memberId}`
-
-Updates a member's role.
-
----
-
-## DELETE `/workspaces/{workspaceId}/members/{memberId}`
-
-Removes a member.
+See also: [§7 Workspace Context](#7-workspace-context), and the deferral list in
+`roadmap.md` §19.
 
 ---
 
@@ -3156,7 +3342,7 @@ POST /auth/register
 POST /auth/login
 POST /auth/refresh
 POST /auth/logout
-GET  /auth/me
+GET  /users/me
 ```
 
 ## Workspace
@@ -3164,8 +3350,9 @@ GET  /auth/me
 ```text
 GET  /workspaces
 POST /workspaces
-GET  /workspaces/{id}
-PATCH /workspaces/{id}
+POST /workspaces/{id}/switch
+GET  /workspaces/current
+PATCH /workspaces/current
 ```
 
 ## Brand & Audience

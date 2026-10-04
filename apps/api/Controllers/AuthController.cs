@@ -17,15 +17,18 @@ public sealed class AuthController : ControllerBase
     private readonly AppDbContext _dbContext;
     private readonly JwtTokenService _jwtTokenService;
     private readonly IRefreshTokenService _refreshTokenService;
+    private readonly IAuthCookieService _authCookieService;
 
     public AuthController(
         AppDbContext dbContext,
         JwtTokenService jwtTokenService,
-        IRefreshTokenService refreshTokenService)
+        IRefreshTokenService refreshTokenService,
+        IAuthCookieService authCookieService)
     {
         _dbContext = dbContext;
         _jwtTokenService = jwtTokenService;
         _refreshTokenService = refreshTokenService;
+        _authCookieService = authCookieService;
     }
 
     [HttpPost("register")]
@@ -103,11 +106,16 @@ public sealed class AuthController : ControllerBase
             workspace.Id,
             cancellationToken);
 
+        _authCookieService.Write(
+            HttpContext,
+            token,
+            refreshToken,
+            expiresAt);
+
         return Ok(new ApiResponse<AuthResponse>
         {
             Data = new AuthResponse
             {
-                AccessToken = token,
                 ExpiresAt = expiresAt,
                 WorkspaceId = workspace.Id,
                 User = new UserResponse
@@ -116,8 +124,7 @@ public sealed class AuthController : ControllerBase
                     Email = user.Email,
                     FirstName = user.FirstName,
                     LastName = user.LastName
-                },
-                RefreshToken = refreshToken
+                }
             },
             Message = "Account created successfully."
         });
@@ -164,10 +171,15 @@ public sealed class AuthController : ControllerBase
             });
         }
 
-        var membership = await _dbContext.WorkspaceMembers
-            .FirstOrDefaultAsync(
-                x => x.UserId == user.Id,
-                cancellationToken);
+        // The oldest membership wins, with the identifier as the tie-break. The
+        // rule itself, and why it is ordered that way, is on
+        // WorkspaceMembershipOrder; the workspace listing uses the same one, so a
+        // switcher cannot disagree with login about which workspace is current.
+        var membership = await WorkspaceMembershipOrder.Apply(
+                _dbContext.WorkspaceMembers
+                    .AsNoTracking()
+                    .Where(x => x.UserId == user.Id))
+            .FirstOrDefaultAsync(cancellationToken);
 
         if (membership is null)
         {
@@ -192,11 +204,16 @@ public sealed class AuthController : ControllerBase
             membership.WorkspaceId,
             cancellationToken);
 
+        _authCookieService.Write(
+            HttpContext,
+            token,
+            refreshToken,
+            expiresAt);
+
         return Ok(new ApiResponse<AuthResponse>
         {
             Data = new AuthResponse
             {
-                AccessToken = token,
                 ExpiresAt = expiresAt,
                 WorkspaceId = membership.WorkspaceId,
                 User = new UserResponse
@@ -205,8 +222,7 @@ public sealed class AuthController : ControllerBase
                     Email = user.Email,
                     FirstName = user.FirstName,
                     LastName = user.LastName
-                },
-                RefreshToken = refreshToken
+                }
             },
             Message = "Login successful."
         });
@@ -214,18 +230,61 @@ public sealed class AuthController : ControllerBase
 
     [HttpPost("refresh")]
     public async Task<IActionResult> Refresh(
-        RefreshTokenRequest request,
         CancellationToken cancellationToken)
     {
-        var session = await _refreshTokenService.RefreshAsync(
-            request.RefreshToken,
-            cancellationToken);
+        var presentedToken = _authCookieService.ReadRefreshToken(
+            HttpContext);
+
+        // A failed refresh leaves the browser holding a credential the server
+        // has already consumed. Left in place, the next automatic refresh would
+        // present it again, which rotation reports as a replay and answers by
+        // revoking the live session the user is actually using. So the cookie is
+        // cleared whenever the presented token does not produce a new session.
+        if (string.IsNullOrWhiteSpace(presentedToken))
+        {
+            _authCookieService.Clear(HttpContext);
+
+            return Unauthorized(new ApiErrorResponse
+            {
+                Error = new ApiError
+                {
+                    Code = "INVALID_REFRESH_TOKEN",
+                    Message = "No refresh session was presented."
+                },
+                TraceId = HttpContext.TraceIdentifier
+            });
+        }
+
+        RefreshedSession session;
+
+        try
+        {
+            session = await _refreshTokenService.RefreshAsync(
+                presentedToken,
+                cancellationToken);
+        }
+        catch (Exception exception) when (exception is
+            InvalidRefreshTokenException or
+            ExpiredRefreshTokenException or
+            RevokedRefreshTokenException or
+            ReusedRefreshTokenException or
+            RefreshTokenRotationConflictException)
+        {
+            _authCookieService.Clear(HttpContext);
+
+            throw;
+        }
+
+        _authCookieService.Write(
+            HttpContext,
+            session.AccessToken,
+            session.RefreshToken,
+            session.AccessTokenExpiresAt);
 
         return Ok(new ApiResponse<AuthResponse>
         {
             Data = new AuthResponse
             {
-                AccessToken = session.AccessToken,
                 ExpiresAt = session.AccessTokenExpiresAt,
                 WorkspaceId = session.WorkspaceId,
                 User = new UserResponse
@@ -234,8 +293,7 @@ public sealed class AuthController : ControllerBase
                     Email = session.Email,
                     FirstName = session.FirstName,
                     LastName = session.LastName
-                },
-                RefreshToken = session.RefreshToken
+                }
             },
             Message = "Token refreshed successfully."
         });
@@ -243,12 +301,18 @@ public sealed class AuthController : ControllerBase
 
     [HttpPost("logout")]
     public async Task<IActionResult> Logout(
-        RefreshTokenRequest request,
         CancellationToken cancellationToken)
     {
+        var presentedToken = _authCookieService.ReadRefreshToken(
+            HttpContext);
+
+        // Revocation failures are deliberately not caught. A logout that could
+        // not be persisted must not report success.
         await _refreshTokenService.RevokeAsync(
-            request.RefreshToken,
+            presentedToken ?? string.Empty,
             cancellationToken);
+
+        _authCookieService.Clear(HttpContext);
 
         return Ok(new ApiResponse<object>
         {

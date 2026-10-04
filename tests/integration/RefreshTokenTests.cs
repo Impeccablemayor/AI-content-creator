@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Api.Configuration;
 using Api.Contracts.Auth;
 using Api.Contracts.Responses;
 using Api.Domain.Entities;
@@ -34,19 +35,26 @@ public sealed class RefreshTokenTests : IAsyncLifetime
             ["RateLimiting:AuthenticationPermitLimit"] = "0"
         });
 
-    private HttpClient _client = null!;
+private BrowserClient _browser = null!;
+    private HttpClient _controlled = null!;
 
     public async Task InitializeAsync()
     {
         _factory.Initialise();
         await _factory.MigrateAsync();
 
-        _client = _factory.CreateClient();
+        _browser = new BrowserClient(_factory);
+
+        // Separate from _browser, because the properties under test are about
+        // presenting one exact refresh token, and a browser that manages its own
+        // jar cannot be told to send a token it does not hold.
+        _controlled = _factory.CreateCookieControlledClient();
     }
 
-public Task DisposeAsync()
+    public Task DisposeAsync()
     {
-        _client?.Dispose();
+        _browser?.Dispose();
+        _controlled?.Dispose();
         _factory.Dispose();
 
         return Task.CompletedTask;
@@ -55,44 +63,72 @@ public Task DisposeAsync()
     // ---------------------------------------------------------------- issuing
 
     [Fact]
-    public async Task Register_issues_an_access_token_and_a_refresh_token()
+    public async Task Register_issues_a_session_as_cookies_and_never_in_the_body()
     {
-        var session = await TestSession.RegisterAsync(_client, "issue");
+        using var response = await _browser.PostAsync("api/v1/auth/register",
+            new
+            {
+                email = "issue@example.test",
+                password = "Integration-Test-Password-42",
+                firstName = "Integration",
+                lastName = "Owner",
+                workspaceName = "Workspace issue"
+            });
+
+        var session = await RegisterAndReadAsync(response);
 
         Assert.False(string.IsNullOrWhiteSpace(session.AccessToken));
         Assert.False(string.IsNullOrWhiteSpace(session.RefreshToken));
         Assert.NotEqual(Guid.Empty, session.WorkspaceId);
         Assert.NotEqual(Guid.Empty, session.UserId);
 
-        // The access token is a JWT that actually authenticates.
-        using var authenticated = _factory.CreateAuthenticatedClient(session.AccessToken);
-        using var response = await authenticated.GetAsync("api/v1/users/me");
+        // The body carries the identity and nothing secret. A token here would
+        // be a token page script could read, which is the entire thing the
+        // cookie is for.
+        var raw = await response.Content.ReadAsStringAsync();
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.DoesNotContain("accessToken", raw, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("refreshToken", raw, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(session.AccessToken, raw, StringComparison.Ordinal);
+        Assert.DoesNotContain(session.RefreshToken, raw, StringComparison.Ordinal);
+
+        // The cookie really authenticates: the same browser, with nothing
+        // added to it, reaches a protected route.
+        using var me = await _browser.GetAsync("api/v1/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, me.StatusCode);
     }
 
     [Fact]
-    public async Task Login_issues_an_access_token_and_a_refresh_token()
+    public async Task Login_issues_a_session_as_cookies_and_never_in_the_body()
     {
-        var session = await TestSession.RegisterAsync(_client, "login-issue");
+        var registered = await TestSession.RegisterAsync(_browser, "login-issue");
 
-        var response = await _client.PostAsJsonAsync(
+        using var response = await _browser.PostAsync(
             "api/v1/auth/login",
-            new { email = session.Email, password = "Integration-Test-Password-42" });
+            new { email = registered.Email, password = "Integration-Test-Password-42" });
 
         var body = await TestHttp.ReadAsync<AuthResponse>(response);
 
         TestHttp.EnsureSucceeded(response, body);
 
-        Assert.False(string.IsNullOrWhiteSpace(body.RefreshToken));
-        Assert.Equal(session.WorkspaceId, body.WorkspaceId);
-        Assert.Equal(session.UserId, body.User.Id);
+        Assert.False(string.IsNullOrWhiteSpace(
+            TestHttp.SetCookieFor(
+                response,
+                AuthCookieOptions.DefaultRefreshTokenCookieName)));
+
+        Assert.Equal(registered.WorkspaceId, body.WorkspaceId);
+        Assert.Equal(registered.UserId, body.User.Id);
+
+        var raw = await response.Content.ReadAsStringAsync();
+
+        Assert.DoesNotContain("refreshToken", raw, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
     public async Task Refresh_token_is_stored_as_a_hash_and_never_as_the_issued_value()
     {
-        var session = await TestSession.RegisterAsync(_client, "storage");
+        var session = await TestSession.RegisterAsync(_browser, "storage");
 
         var stored = await LoadTokensAsync(session.UserId);
 
@@ -118,20 +154,21 @@ public Task DisposeAsync()
 
     // -------------------------------------------------------------- rotation
 
-    [Fact]
+[Fact]
     public async Task Refreshing_with_a_valid_token_succeeds_and_returns_a_new_access_token()
     {
-        var session = await TestSession.RegisterAsync(_client, "refresh-ok");
+        var session = await TestSession.RegisterAsync(_browser, "refresh-ok");
 
         using var response = await RefreshAsync(session.RefreshToken);
-        var body = await TestHttp.ReadAsync<AuthResponse>(response);
 
-        TestHttp.EnsureSucceeded(response, body);
+        TestHttp.EnsureSucceeded(response);
 
-        Assert.False(string.IsNullOrWhiteSpace(body.AccessToken));
+        var accessToken = TestHttp.ReadSetCookie(
+            response,
+            AuthCookieOptions.DefaultAccessTokenCookieName);
 
         // The new access token is usable, so the refresh genuinely re-authenticated.
-        using var authenticated = _factory.CreateAuthenticatedClient(body.AccessToken);
+        using var authenticated = _factory.CreateAuthenticatedClient(accessToken);
         using var me = await authenticated.GetAsync("api/v1/users/me");
 
         Assert.Equal(HttpStatusCode.OK, me.StatusCode);
@@ -140,16 +177,16 @@ public Task DisposeAsync()
     [Fact]
     public async Task Refreshing_rotates_the_refresh_token()
     {
-        var session = await TestSession.RegisterAsync(_client, "rotate");
+        var session = await TestSession.RegisterAsync(_browser, "rotate");
 
         using var response = await RefreshAsync(session.RefreshToken);
-        var body = await TestHttp.ReadAsync<AuthResponse>(response);
 
-        TestHttp.EnsureSucceeded(response, body);
+        TestHttp.EnsureSucceeded(response);
+
+        var rotated = ReadRefreshCookie(response);
 
         // A new value, not the one presented.
-        Assert.NotEqual(session.RefreshToken, body.RefreshToken);
-        Assert.False(string.IsNullOrWhiteSpace(body.RefreshToken));
+        Assert.NotEqual(session.RefreshToken, rotated);
 
         // The original row is marked consumed and linked to its successor.
         var consumed = await LoadTokenByHashAsync(
@@ -174,7 +211,7 @@ public Task DisposeAsync()
     [Fact]
     public async Task The_previous_refresh_token_cannot_be_used_again()
     {
-        var session = await TestSession.RegisterAsync(_client, "old-unusable");
+        var session = await TestSession.RegisterAsync(_browser, "old-unusable");
 
         using var first = await RefreshAsync(session.RefreshToken);
         TestHttp.EnsureSucceeded(first);
@@ -187,19 +224,20 @@ public Task DisposeAsync()
     [Fact]
     public async Task Several_rotation_generations_stay_consistent()
     {
-        var session = await TestSession.RegisterAsync(_client, "generations");
+        var session = await TestSession.RegisterAsync(_browser, "generations");
 
         var current = session.RefreshToken;
 
         for (var generation = 1; generation <= 4; generation++)
         {
             using var response = await RefreshAsync(current);
-            var body = await TestHttp.ReadAsync<AuthResponse>(response);
 
-            TestHttp.EnsureSucceeded(response, body);
+            TestHttp.EnsureSucceeded(response);
 
-            Assert.NotEqual(current, body.RefreshToken);
-            current = body.RefreshToken;
+            var next = ReadRefreshCookie(response);
+
+            Assert.NotEqual(current, next);
+            current = next;
 
             // Each generation leaves exactly one active token for this user.
             var active = (await LoadTokensAsync(session.UserId))
@@ -231,7 +269,7 @@ public Task DisposeAsync()
     [Fact]
     public async Task Replaying_a_consumed_token_is_reported_as_reuse()
     {
-        var session = await TestSession.RegisterAsync(_client, "reuse-code");
+        var session = await TestSession.RegisterAsync(_browser, "reuse-code");
 
         using var first = await RefreshAsync(session.RefreshToken);
         TestHttp.EnsureSucceeded(first);
@@ -252,33 +290,35 @@ public Task DisposeAsync()
         Assert.Equal(RefreshTokenStatus.Reused, consumed.Status);
     }
 
-    [Fact]
+[Fact]
     public async Task Replaying_a_consumed_token_revokes_the_session_it_spawned()
     {
-        var session = await TestSession.RegisterAsync(_client, "reuse-revokes");
+        var session = await TestSession.RegisterAsync(_browser, "reuse-revokes");
 
         using var first = await RefreshAsync(session.RefreshToken);
-        var rotated = await TestHttp.ReadAsync<AuthResponse>(first);
-        TestHttp.EnsureSucceeded(first, rotated);
+
+        TestHttp.EnsureSucceeded(first);
+
+        var rotated = ReadRefreshCookie(first);
 
         // The successor is a live session before the replay.
-        Assert.True(await IsActiveAsync(rotated.RefreshToken));
+        Assert.True(await IsActiveAsync(rotated));
 
         using var replay = await RefreshAsync(session.RefreshToken);
 
         Assert.Equal(HttpStatusCode.Unauthorized, replay.StatusCode);
 
         // The point of reuse detection: the newer session does not survive.
-        Assert.False(await IsActiveAsync(rotated.RefreshToken));
+        Assert.False(await IsActiveAsync(rotated));
 
         var successor = await LoadTokenByHashAsync(
-            Api.Application.Authentication.RefreshTokenService.HashToken(rotated.RefreshToken));
+            Api.Application.Authentication.RefreshTokenService.HashToken(rotated));
 
         Assert.Equal(RefreshTokenStatus.Revoked, successor.Status);
         Assert.Equal("RevokedByReuseDetection", successor.RevocationReason);
 
         // And the live token really is dead at the API, not just marked.
-        using var afterRevocation = await RefreshAsync(rotated.RefreshToken);
+        using var afterRevocation = await RefreshAsync(rotated);
 
         Assert.Equal(HttpStatusCode.Unauthorized, afterRevocation.StatusCode);
         Assert.Equal("REFRESH_TOKEN_REVOKED", await ReadErrorCodeAsync(afterRevocation));
@@ -287,7 +327,7 @@ public Task DisposeAsync()
     [Fact]
     public async Task Reuse_detection_revokes_every_later_generation()
     {
-        var session = await TestSession.RegisterAsync(_client, "reuse-deep");
+        var session = await TestSession.RegisterAsync(_browser, "reuse-deep");
 
         // Three rotations, so the stolen token sits at the back of a chain.
         var generation1 = await RotateAsync(session.RefreshToken);
@@ -314,8 +354,8 @@ public Task DisposeAsync()
     [Fact]
     public async Task Reuse_detection_does_not_reach_another_users_tokens()
     {
-        var first = await TestSession.RegisterAsync(_client, "reuse-a");
-        var second = await TestSession.RegisterAsync(_client, "reuse-b");
+        var first = await TestSession.RegisterAsync(_browser, "reuse-a");
+        var second = await TestSession.RegisterAsync(_browser, "reuse-b");
 
         var firstRotated = await RotateAsync(first.RefreshToken);
         var secondRotated = await RotateAsync(second.RefreshToken);
@@ -335,7 +375,7 @@ public Task DisposeAsync()
     [Fact]
     public async Task Reusing_a_token_a_second_time_stays_a_reuse()
     {
-        var session = await TestSession.RegisterAsync(_client, "reuse-twice");
+        var session = await TestSession.RegisterAsync(_browser, "reuse-twice");
 
         await RotateAsync(session.RefreshToken);
 
@@ -351,7 +391,7 @@ public Task DisposeAsync()
     [Fact]
     public async Task Concurrent_refresh_of_one_token_rotates_it_only_once()
     {
-        var session = await TestSession.RegisterAsync(_client, "concurrent");
+        var session = await TestSession.RegisterAsync(_browser, "concurrent");
 
         // Two requests presenting the same token at the same moment. Exactly one
         // may win the compare-and-swap; the other must not also receive a
@@ -407,7 +447,7 @@ Assert.Single(refused);
     [Fact]
     public async Task Concurrent_logout_and_refresh_never_leave_an_active_session()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout-race");
+        var session = await TestSession.RegisterAsync(_browser, "logout-race");
 
         await Task.WhenAll(
             RefreshAsync(session.RefreshToken),
@@ -429,7 +469,7 @@ Assert.Single(refused);
     [Fact]
     public async Task An_expired_refresh_token_is_rejected()
     {
-        var session = await TestSession.RegisterAsync(_client, "expired");
+        var session = await TestSession.RegisterAsync(_browser, "expired");
 
         await ExpireAsync(
             Api.Application.Authentication.RefreshTokenService.HashToken(session.RefreshToken));
@@ -448,7 +488,7 @@ Assert.Single(refused);
     [Fact]
     public async Task A_token_expiring_in_the_past_is_rejected_without_being_written_back()
     {
-        var session = await TestSession.RegisterAsync(_client, "expired-past");
+        var session = await TestSession.RegisterAsync(_browser, "expired-past");
 
         // Move the expiry into the past without changing the status, so the
         // check has to consult ExpiresAt rather than trusting the stored state.
@@ -465,7 +505,7 @@ Assert.Single(refused);
     [Fact]
     public async Task Refresh_lifetime_comes_from_configuration_not_a_constant()
     {
-        var session = await TestSession.RegisterAsync(_client, "expiry-config");
+        var session = await TestSession.RegisterAsync(_browser, "expiry-config");
 
         var stored = await LoadTokenByHashAsync(
             Api.Application.Authentication.RefreshTokenService.HashToken(session.RefreshToken));
@@ -486,7 +526,7 @@ Assert.Single(refused);
     [Fact]
     public async Task A_revoked_refresh_token_is_rejected()
     {
-        var session = await TestSession.RegisterAsync(_client, "revoked");
+        var session = await TestSession.RegisterAsync(_browser, "revoked");
 
         using var logout = await LogoutAsync(session.RefreshToken);
         TestHttp.EnsureSucceeded(logout);
@@ -502,7 +542,7 @@ Assert.Single(refused);
     [Fact]
     public async Task Logout_revokes_the_token_so_it_cannot_refresh()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout");
+        var session = await TestSession.RegisterAsync(_browser, "logout");
 
         Assert.True(await IsActiveAsync(session.RefreshToken));
 
@@ -528,7 +568,7 @@ Assert.Single(refused);
     [Fact]
     public async Task Logging_out_twice_is_idempotent()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout-twice");
+        var session = await TestSession.RegisterAsync(_browser, "logout-twice");
 
         using var first = await LogoutAsync(session.RefreshToken);
         using var second = await LogoutAsync(session.RefreshToken);
@@ -547,7 +587,7 @@ Assert.Single(refused);
     [Fact]
     public async Task Logging_out_an_unknown_token_succeeds_without_touching_anything()
     {
-        var session = await TestSession.RegisterAsync(_client, "logout-unknown");
+        var session = await TestSession.RegisterAsync(_browser, "logout-unknown");
 
         using var response = await LogoutAsync("not-a-real-refresh-token");
 
@@ -571,8 +611,8 @@ Assert.Single(refused);
     [Fact]
     public async Task One_user_cannot_log_out_another_users_session()
     {
-        var first = await TestSession.RegisterAsync(_client, "logout-a");
-        var second = await TestSession.RegisterAsync(_client, "logout-b");
+        var first = await TestSession.RegisterAsync(_browser, "logout-a");
+        var second = await TestSession.RegisterAsync(_browser, "logout-b");
 
         // The second user presents the first user's token.
         using var response = await LogoutAsync(first.RefreshToken);
@@ -587,13 +627,13 @@ Assert.Single(refused);
 
     // -------------------------------------------------------------- isolation
 
-    [Fact]
+[Fact]
     public async Task Refreshing_yields_the_workspace_the_token_was_issued_for()
     {
-        var first = await TestSession.RegisterAsync(_client, "iso-a");
-        var second = await TestSession.RegisterAsync(_client, "iso-b");
+        var first = await TestSession.RegisterAsync(_browser, "iso-a");
+        var second = await TestSession.RegisterAsync(_browser, "iso-b");
 
-using var response = await RefreshAsync(first.RefreshToken);
+        using var response = await RefreshAsync(first.RefreshToken);
         var body = await TestHttp.ReadAsync<AuthResponse>(response);
 
         TestHttp.EnsureSucceeded(response, body);
@@ -608,7 +648,7 @@ using var response = await RefreshAsync(first.RefreshToken);
     [Fact]
     public async Task A_token_whose_membership_was_removed_can_no_longer_refresh()
     {
-        var session = await TestSession.RegisterAsync(_client, "iso-membership");
+        var session = await TestSession.RegisterAsync(_browser, "iso-membership");
 
         // Server-side ownership: revoking the membership must invalidate a
         // token that is otherwise perfectly valid, without waiting for expiry.
@@ -625,7 +665,7 @@ using var response = await RefreshAsync(first.RefreshToken);
     [Fact]
     public async Task A_token_for_a_deactivated_user_can_no_longer_refresh()
     {
-        var session = await TestSession.RegisterAsync(_client, "iso-inactive");
+        var session = await TestSession.RegisterAsync(_browser, "iso-inactive");
 
         await DeactivateUserAsync(session.UserId);
 
@@ -654,26 +694,65 @@ using var response = await RefreshAsync(first.RefreshToken);
         Assert.Equal("INVALID_REFRESH_TOKEN", await ReadErrorCodeAsync(response));
     }
 
-    // ----------------------------------------------------------------- helpers
+// ----------------------------------------------------------------- helpers
 
+    /// <summary>
+    /// Refresh with exactly one token in the cookie, and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately no body and no access cookie. The API reads the refresh
+    /// token from the cookie alone, and a request that also carried an access
+    /// token would prove nothing about which one decided the outcome.
+    /// </remarks>
     private Task<HttpResponseMessage> RefreshAsync(string refreshToken) =>
-        _client.PostAsJsonAsync(
-            "api/v1/auth/refresh",
-            new { refreshToken });
+        _controlled.SendAsync(
+            new HttpRequestMessage(HttpMethod.Post, "api/v1/auth/refresh")
+                .WithCookie(
+                    AuthCookieOptions.DefaultRefreshTokenCookieName,
+                    refreshToken));
 
     private Task<HttpResponseMessage> LogoutAsync(string refreshToken) =>
-        _client.PostAsJsonAsync(
-            "api/v1/auth/logout",
-            new { refreshToken });
+        _controlled.SendAsync(
+            new HttpRequestMessage(HttpMethod.Post, "api/v1/auth/logout")
+                .WithCookie(
+                    AuthCookieOptions.DefaultRefreshTokenCookieName,
+                    refreshToken));
 
-    private async Task<string> RotateAsync(string refreshToken)
+    private static string ReadRefreshCookie(HttpResponseMessage response) =>
+        TestHttp.ReadSetCookie(
+            response,
+            AuthCookieOptions.DefaultRefreshTokenCookieName);
+
+    /// <summary>
+    /// Reads the session off one registration response, so a test can assert on
+    /// the raw body of its own registration.
+    /// </summary>
+    private static async Task<TestSession> RegisterAndReadAsync(
+        HttpResponseMessage response)
     {
-        using var response = await RefreshAsync(refreshToken);
         var body = await TestHttp.ReadAsync<AuthResponse>(response);
 
         TestHttp.EnsureSucceeded(response, body);
 
-        return body.RefreshToken;
+        return new TestSession(
+            body.WorkspaceId,
+            TestHttp.ReadSetCookie(
+                response,
+                AuthCookieOptions.DefaultAccessTokenCookieName),
+            body.User.Id,
+            TestHttp.ReadSetCookie(
+                response,
+                AuthCookieOptions.DefaultRefreshTokenCookieName),
+            body.User.Email);
+    }
+
+    private async Task<string> RotateAsync(string refreshToken)
+    {
+        using var response = await RefreshAsync(refreshToken);
+
+        TestHttp.EnsureSucceeded(response);
+
+        return ReadRefreshCookie(response);
     }
 
 private static async Task<string> ReadErrorCodeAsync(HttpResponseMessage response)

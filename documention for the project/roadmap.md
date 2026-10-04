@@ -281,6 +281,11 @@ Publish
 - Workspace creation
 - Workspace membership
 
+Status: registration, login, logout, refresh, workspace creation, and
+membership-checked workspace switching are delivered as a cookie session. See
+the Security Gate for the session properties and what is still missing
+(password management and member management).
+
 ### Brand Intelligence
 
 - Brand profile
@@ -1202,6 +1207,22 @@ Each major phase should meet a release gate.
 - Secrets are protected
 - Sensitive data is encrypted appropriately
 - Audit logging is operational
+
+### Browser session status
+
+| Property | Status |
+| --- | --- |
+| No credential in any response body | Met; asserted by integration test |
+| Both credentials `HttpOnly`, `Path=/`, `Secure` outside Development | Met |
+| `SameSite=Lax` by default; `None` requires `Secure` and is refused at startup otherwise | Met |
+| Workspace derived from the session claim, never from a request header or body | Met |
+| Workspace switch membership-checked; cross-tenant returns `403` | Met |
+| Refresh token bound to the workspace it was issued for | Met |
+| Refresh rotation with reuse detection | Met |
+| Bearer header still accepted and validated identically, for non-browser clients | Met |
+| Password management (forgot/reset) | Not met; not implemented |
+| Member management endpoints | Not met; not implemented |
+| CSRF token for cross-site deployments | Not applicable under `SameSite=Lax`; a cross-site deployment using `SameSite=None` must add its own CSRF defence, because a cross-site request then carries the cookie automatically |
 
 ---
 

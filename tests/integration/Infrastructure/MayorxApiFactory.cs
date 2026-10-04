@@ -2,6 +2,7 @@ using Api.Application.AI;
 using Api.Application.AnalyticsSync;
 using Api.Application.Publishing;
 using Api.Application.Scheduling;
+using Api.Configuration;
 using Api.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -62,6 +63,36 @@ private readonly IReadOnlyDictionary<string, string?> _settings;
 
     private bool _databaseCreated;
     private string _environment = "Testing";
+    private bool _ownsAuthCookieSettings;
+
+    /// <summary>
+    /// Stops <see cref="Initialise"/> from forcing the test-wide cookie settings,
+    /// so a host can run on the API's own defaults.
+    /// </summary>
+    /// <remarks>
+    /// The cookie tests need <c>AuthCookies:Secure=false</c> because the test host
+    /// serves plain HTTP, but a test that asserts what the API chooses unprompted
+    /// needs the opposite. The two are separated by this flag rather than by
+    /// ordering, because the settings are process-wide and ordering alone would
+    /// depend on which test class happened to build its host first.
+    /// </remarks>
+    public void OwnsAuthCookieSettings()
+    {
+        _ownsAuthCookieSettings = true;
+    }
+
+    /// <summary>
+    /// Restores the process-wide cookie settings every host expects.
+    /// </summary>
+    public static void ResetAuthCookieEnvironment()
+    {
+        Environment.SetEnvironmentVariable(
+            "AuthCookies__SameSite",
+            "Lax");
+        Environment.SetEnvironmentVariable(
+            "AuthCookies__Secure",
+            "false");
+    }
 
     /// <summary>
     /// Selects the hosting environment for this host, which is what decides
@@ -156,18 +187,61 @@ private MayorxApiFactory(
 
 
 /// <summary>
-/// A client that carries a bearer token. Each call returns a separate client over
-/// the same in-memory server.
-/// </summary>
-public HttpClient CreateAuthenticatedClient(string accessToken)
-{
-    var client = CreateClient();
+    /// A client that carries a bearer token. Each call returns a separate client over
+    /// the in-memory server.
+    /// </summary>
+    public HttpClient CreateAuthenticatedClient(string accessToken)
+    {
+        var client = CreateClient();
 
-    client.DefaultRequestHeaders.Authorization =
-        new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
 
-    return client;
-}
+        return client;
+    }
+
+    /// <summary>
+    /// A client that does not manage cookies at all, so a test decides exactly
+    /// what the <c>Cookie</c> header carries.
+    /// </summary>
+    /// <remarks>
+    /// Several of the refresh-token properties under test are about presenting
+    /// one specific token: a token rotation has already consumed, a token that
+    /// was never issued, an unknown value. A client that silently manages its own
+    /// jar cannot be told to send one of those, so those tests drive the cookie
+    /// header themselves. Ordinary browser behaviour is exercised by the default
+    /// client instead.
+    /// </remarks>
+    public HttpClient CreateCookieControlledClient() =>
+        CreateClient(new WebApplicationFactoryClientOptions
+        {
+            HandleCookies = false
+        });
+
+    /// <summary>
+    /// Drops the test-wide cookie settings so a host can observe the API's own
+    /// defaults.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Initialise"/> states <c>AuthCookies:Secure=false</c> for every
+    /// host, which is the only way the cookie tests can work over plain HTTP. A
+    /// test that needs to see what the API would choose unprompted therefore has
+    /// to undo it, and has to be able to undo exactly one of the two settings
+    /// without guessing which one another class changed.
+    /// </remarks>
+    /// <param name="sameSite">
+    /// The value to configure, or null to fall back to the API's own default.
+    /// </param>
+    /// <param name="secure">
+    /// The value to configure, or null to fall back to the API's own default.
+    /// </param>
+    public void ConfigureAuthCookies(string? sameSite, string? secure)
+    {
+        // A null value removes the variable, which is what makes the API fall
+        // back to its own default rather than to a leftover one.
+        Set("AuthCookies__SameSite", sameSite);
+        Set("AuthCookies__Secure", secure);
+    }
 
 private void ConfigureUnreachable()
 {
@@ -194,9 +268,25 @@ private void ConfigureUnreachable()
         // No DataProtection key ring path is set, so keys stay in memory. The test
         // encrypts and decrypts inside one process, and a key ring on disk would be
         // shared state between runs and a file in the working tree.
-        Set("Jwt__SecretKey", IntegrationTestSettings.JwtSecretKey);
+Set("Jwt__SecretKey", IntegrationTestSettings.JwtSecretKey);
         Set("Jwt__Issuer", IntegrationTestSettings.JwtIssuer);
         Set("Jwt__Audience", IntegrationTestSettings.JwtAudience);
+
+// Stated rather than left to the default. The API marks its cookies
+        // Secure everywhere except Development, which is correct for a
+        // deployment and wrong here: the test host serves plain HTTP, and a
+        // browser-faithful client correctly refuses to return a Secure cookie
+        // over it, so every cookie test would fail for a reason that has
+        // nothing to do with the code under test.
+        //
+        // Pinned rather than left unset, because these are process-wide variables
+        // and a test that changes SameSite for its own host would otherwise leave
+        // it behind for whichever class built its host next.
+        if (!_ownsAuthCookieSettings)
+        {
+            Set("AuthCookies__Secure", "false");
+            Set("AuthCookies__SameSite", "Lax");
+        }
 
         // The provider is replaced in the container, so these exist only to satisfy
         // the API's own startup validation, which stays in the path being tested.
@@ -315,7 +405,7 @@ services.AddSocialPublishing(configuration);
         RunWorkerStepAsync(services =>
             services.GetRequiredService<IAnalyticsSyncProcessor>().RunOnceAsync(CancellationToken.None));
 
-private static void Set(string name, string value) =>
+private static void Set(string name, string? value) =>
         Environment.SetEnvironmentVariable(name, value);
 
     protected override void Dispose(bool disposing)
