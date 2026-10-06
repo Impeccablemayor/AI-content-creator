@@ -33,6 +33,7 @@ const navigation: NavigationGroup[] = [
     items: [
       { label: "Content", href: "/content", icon: "content" },
       { label: "Ideas", href: "/content/ideas", icon: "idea" },
+      { label: "Drafts", href: "/content/drafts", icon: "content" },
       { label: "Calendar", href: "/calendar", icon: "calendar" },
     ],
   },
