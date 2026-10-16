@@ -175,6 +175,13 @@ export interface ContentPost {
   updatedAt: string;
 }
 
+export interface PublishNowResponse {
+  post: ContentPost;
+  outcome: "Published" | "Failed" | "Skipped";
+  failureReason: string | null;
+  externalPostId: string | null;
+}
+
 export interface GenerateContentPostRequest {
   platform: ContentPlatform;
 }

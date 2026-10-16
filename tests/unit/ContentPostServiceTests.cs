@@ -192,6 +192,7 @@ public sealed class ContentPostServiceTests
             new ContentPostPromptBuilder(),
             new ContentEvaluationPromptBuilder(),
             new ContentRepetitionDetector(),
+            new NotSchedulingScheduledPostStore(),
             NullLogger<ContentPostService>.Instance,
             Options.Create(new AiOptions
             {
@@ -199,7 +200,8 @@ public sealed class ContentPostServiceTests
                 Model = "test-model",
                 ApiKey = "test-placeholder"
             }),
-            Options.Create(new ContentQualityOptions()));
+            Options.Create(new ContentQualityOptions()),
+            Options.Create(new SchedulingOptions()));
 
     private static CurrentUserService CreateCurrentUser(Guid workspaceId)
     {

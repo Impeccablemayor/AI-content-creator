@@ -6,6 +6,7 @@ using Api.Application.AI.Prompts;
 using Api.Application.Authentication;
 using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
+using Api.Application.Scheduling;
 using Api.Application.AuditLogs;
 using Api.Application.ContentPosts;
 using Api.Contracts.ContentPost;
@@ -34,9 +35,11 @@ public sealed class ContentPostService : IContentPostService
     private readonly ContentPostPromptBuilder _promptBuilder;
     private readonly ContentEvaluationPromptBuilder _evaluationPromptBuilder;
     private readonly ContentRepetitionDetector _repetitionDetector;
+    private readonly IScheduledPostStore _scheduledPostStore;
     private readonly ILogger<ContentPostService> _logger;
     private readonly AiOptions _aiOptions;
     private readonly ContentQualityOptions _contentQualityOptions;
+    private readonly SchedulingOptions _schedulingOptions;
 
     public ContentPostService(
         AppDbContext dbContext,
@@ -47,9 +50,11 @@ public sealed class ContentPostService : IContentPostService
         ContentPostPromptBuilder promptBuilder,
         ContentEvaluationPromptBuilder evaluationPromptBuilder,
         ContentRepetitionDetector repetitionDetector,
+        IScheduledPostStore scheduledPostStore,
         ILogger<ContentPostService> logger,
         IOptions<AiOptions> aiOptions,
-        IOptions<ContentQualityOptions> contentQualityOptions)
+        IOptions<ContentQualityOptions> contentQualityOptions,
+        IOptions<SchedulingOptions> schedulingOptions)
     {
         _dbContext = dbContext;
         _currentUser = currentUser;
@@ -59,9 +64,11 @@ public sealed class ContentPostService : IContentPostService
         _promptBuilder = promptBuilder;
         _evaluationPromptBuilder = evaluationPromptBuilder;
         _repetitionDetector = repetitionDetector;
+        _scheduledPostStore = scheduledPostStore;
         _logger = logger;
         _aiOptions = aiOptions.Value;
         _contentQualityOptions = contentQualityOptions.Value;
+        _schedulingOptions = schedulingOptions.Value;
     }
 
     public async Task<ContentPostResponse?> GenerateFromIdeaAsync(
@@ -281,6 +288,7 @@ public sealed class ContentPostService : IContentPostService
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        var workspaceId = _currentUser.WorkspaceId;
         var post = await FindTrackedPostAsync(id, cancellationToken);
         if (post is null)
         {
@@ -301,12 +309,43 @@ public sealed class ContentPostService : IContentPostService
                 "ScheduledAt must be in the future.");
         }
 
-        post.Status = ContentPostStatus.Scheduled;
-        post.ScheduledAt = scheduledAt;
-        post.PublishClaimedAt = null;
-        post.UpdatedAt = DateTime.UtcNow;
+        var claimExpiry = ScheduledPostClaimPolicy.ResolveClaimExpiry(
+            TimeSpan.FromMinutes(_schedulingOptions.ClaimExpiryMinutes));
 
-        // Queued, not saved: written by the same SaveChanges as the schedule.
+        // The write is conditional: it only takes effect while the post is still
+        // approved or scheduled and holds no un-expired publish claim. A reschedule
+        // can therefore never clear the claim of an in-flight publish.
+        await using var transaction =
+            await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+        if (!await _scheduledPostStore.TryScheduleAsync(
+            id,
+            workspaceId,
+            scheduledAt,
+            DateTime.UtcNow,
+            claimExpiry,
+            cancellationToken))
+        {
+            var current = await FindTrackedPostAsync(id, cancellationToken);
+            if (current is null)
+            {
+                return null;
+            }
+
+            if (!ContentPostStatusTransitions.CanSchedule(current.Status))
+            {
+                throw new InvalidContentPostTransitionException(
+                    "Only approved content posts can be scheduled, and a scheduled post " +
+                    $"can only be rescheduled. This post is {current.Status}.");
+            }
+
+            throw new InvalidContentPostTransitionException(
+                "This post is currently being published and cannot be rescheduled. " +
+                "Refresh and try again.");
+        }
+
+        // Queued, not saved: the row is written by the same SaveChanges as the
+        // audit entry, inside the transaction that also took the conditional
+        // schedule write.
         await _auditLog.RecordAsync(
             AuditAction.ScheduleCreated,
             "ContentPost",
@@ -320,8 +359,9 @@ public sealed class ContentPostService : IContentPostService
             cancellationToken);
 
         await _dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
 
-        return Map(post);
+        return await GetAsync(id, cancellationToken);
     }
 
     private async Task<ContentPostResponse?> TransitionAsync(

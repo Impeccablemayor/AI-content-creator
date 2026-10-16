@@ -1,0 +1,7 @@
+{
+  "name": "mayorx-content-engine",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.js"
+  }
+}

@@ -342,6 +342,10 @@ export function Dialog({
       ref={dialogRef}
       aria-labelledby={titleId}
       className={`dialog dialog-${placement} ${className}`.trim()}
+      onClick={(event) => {
+        props.onClick?.(event);
+        if (!event.defaultPrevented && event.target === event.currentTarget) onClose();
+      }}
       onCancel={(event) => {
         props.onCancel?.(event);
         if (!event.defaultPrevented) onClose();

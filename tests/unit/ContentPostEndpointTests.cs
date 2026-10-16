@@ -1,5 +1,6 @@
 using System.Reflection;
 using Api.Application.ContentPosts;
+using Api.Application.Publishing;
 using Api.Contracts.ContentPost;
 using Api.Contracts.Responses;
 using Api.Controllers;
@@ -69,6 +70,8 @@ public sealed class ContentPostEndpointTests
     [InlineData(nameof(ContentPostsController.Reject), "{id:guid}/reject")]
     [InlineData(nameof(ContentPostsController.Evaluate), "{id:guid}/evaluate")]
     [InlineData(nameof(ContentPostsController.Schedule), "{id:guid}/schedule")]
+    [InlineData(nameof(ContentPostsController.PublishNow), "{id:guid}/publish-now")]
+    [InlineData(nameof(ContentPostsController.CancelSchedule), "{id:guid}/cancel-schedule")]
     public void Post_actions_use_post_verbs_on_guarded_id_templates(string actionName, string expectedTemplate)
     {
         var action = GetActions()
@@ -82,7 +85,7 @@ public sealed class ContentPostEndpointTests
     public async Task List_returns_the_success_envelope()
     {
         var data = new List<ContentPostResponse> { new() { Id = Guid.NewGuid(), Status = "Draft" } };
-        var controller = new ContentPostsController(new StubContentPostService { List = data });
+        var controller = CreateController(new StubContentPostService { List = data });
 
         var result = await controller.Get(null, null, CancellationToken.None);
 
@@ -96,7 +99,7 @@ public sealed class ContentPostEndpointTests
     public async Task Get_returns_the_success_envelope()
     {
         var post = new ContentPostResponse { Id = Guid.NewGuid(), Status = "Draft" };
-        var controller = new ContentPostsController(new StubContentPostService { Single = post });
+        var controller = CreateController(new StubContentPostService { Single = post });
 
         var result = await controller.Get(post.Id, CancellationToken.None);
 
@@ -114,7 +117,7 @@ public sealed class ContentPostEndpointTests
     [InlineData(nameof(ContentPostsController.Reject))]
     public async Task Missing_post_returns_a_404_with_the_standard_error_envelope(string actionName)
     {
-        var controller = new ContentPostsController(new StubContentPostService { Single = null });
+        var controller = CreateController(new StubContentPostService { Single = null });
 
         var result = await InvokeAsync(controller, actionName);
 
@@ -131,7 +134,7 @@ public sealed class ContentPostEndpointTests
     public async Task Invalid_transition_returns_a_409_with_the_standard_error_envelope(string actionName)
     {
         var message = "Only draft content posts can be approved.";
-        var controller = new ContentPostsController(new StubContentPostService
+        var controller = CreateController(new StubContentPostService
         {
             Single = new ContentPostResponse { Id = Guid.NewGuid() },
             TransitionFailure = new InvalidContentPostTransitionException(message)
@@ -149,7 +152,7 @@ public sealed class ContentPostEndpointTests
     public async Task Invalid_edited_content_returns_a_400_with_the_standard_error_envelope()
     {
         var message = "The content post contained missing or oversized post content.";
-        var controller = new ContentPostsController(new StubContentPostService
+        var controller = CreateController(new StubContentPostService
         {
             Single = new ContentPostResponse { Id = Guid.NewGuid() },
             ContentFailure = new InvalidContentPostContentException(message)
@@ -170,7 +173,7 @@ public sealed class ContentPostEndpointTests
     public async Task Update_returns_the_success_envelope()
     {
         var post = new ContentPostResponse { Id = Guid.NewGuid(), Status = "Draft" };
-        var controller = new ContentPostsController(new StubContentPostService { Single = post });
+        var controller = CreateController(new StubContentPostService { Single = post });
 
         var result = await controller.Update(Guid.NewGuid(), CreateRequest(), CancellationToken.None);
 
@@ -190,7 +193,7 @@ public sealed class ContentPostEndpointTests
             Status = "Scheduled",
             ScheduledAt = scheduledAt
         };
-        var controller = new ContentPostsController(new StubContentPostService
+        var controller = CreateController(new StubContentPostService
         {
             Scheduled = post
         });
@@ -210,7 +213,7 @@ public sealed class ContentPostEndpointTests
     [Fact]
     public async Task Schedule_returns_404_for_an_unknown_or_foreign_post()
     {
-        var controller = new ContentPostsController(new StubContentPostService
+        var controller = CreateController(new StubContentPostService
         {
             Scheduled = null
         });
@@ -224,6 +227,44 @@ public sealed class ContentPostEndpointTests
         Assert.Equal(
             "CONTENT_POST_NOT_FOUND",
             Assert.IsType<ApiErrorResponse>(notFound.Value).Error.Code);
+    }
+
+    [Fact]
+    public async Task Publish_now_returns_the_attempt_outcome()
+    {
+        var post = new ContentPostResponse { Id = Guid.NewGuid(), Status = "Published" };
+        var publishingResult = new PublishNowResponse
+        {
+            Post = post,
+            Outcome = "Published",
+            ExternalPostId = "external-1"
+        };
+        var controller = CreateController(
+            new StubContentPostService(),
+            new StubContentPostPublishingActions { PublishResult = publishingResult });
+
+        var result = await controller.PublishNow(post.Id, CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var envelope = Assert.IsType<ApiResponse<PublishNowResponse>>(ok.Value);
+        Assert.Equal("Content post published successfully.", envelope.Message);
+        Assert.Same(publishingResult, envelope.Data);
+    }
+
+    [Fact]
+    public async Task Cancel_schedule_returns_the_approved_post()
+    {
+        var post = new ContentPostResponse { Id = Guid.NewGuid(), Status = "Approved" };
+        var controller = CreateController(
+            new StubContentPostService(),
+            new StubContentPostPublishingActions { CancelResult = post });
+
+        var result = await controller.CancelSchedule(post.Id, CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var envelope = Assert.IsType<ApiResponse<ContentPostResponse>>(ok.Value);
+        Assert.Equal("Schedule cancelled and post returned to Approved.", envelope.Message);
+        Assert.Same(post, envelope.Data);
     }
 
     [Fact]
@@ -252,7 +293,7 @@ public sealed class ContentPostEndpointTests
             Recommendation = "MinorEdit",
             PassThreshold = 70m
         };
-        var controller = new ContentPostsController(new StubContentPostService
+        var controller = CreateController(new StubContentPostService
         {
             Single = post,
             Evaluation = evaluation
@@ -270,7 +311,7 @@ public sealed class ContentPostEndpointTests
     [Fact]
     public async Task Evaluate_returns_404_for_an_unknown_or_foreign_post()
     {
-        var controller = new ContentPostsController(new StubContentPostService
+        var controller = CreateController(new StubContentPostService
         {
             Single = null,
             Evaluation = null
@@ -315,6 +356,28 @@ public sealed class ContentPostEndpointTests
         typeof(ContentPostsController)
             .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
             .Where(method => method.GetCustomAttributes<HttpMethodAttribute>().Any());
+
+    private static ContentPostsController CreateController(
+        IContentPostService service,
+        StubContentPostPublishingActions? publishingActions = null) =>
+        new(service, publishingActions ?? new StubContentPostPublishingActions());
+
+    private sealed class StubContentPostPublishingActions : IContentPostPublishingActions
+    {
+        public PublishNowResponse? PublishResult { get; init; }
+
+        public ContentPostResponse? CancelResult { get; init; }
+
+        public Task<PublishNowResponse?> PublishNowAsync(
+            Guid contentPostId,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(PublishResult);
+
+        public Task<ContentPostResponse?> CancelScheduleAsync(
+            Guid contentPostId,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(CancelResult);
+    }
 
     private static UpdateContentPostRequest CreateRequest() => new()
     {

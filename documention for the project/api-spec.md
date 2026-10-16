@@ -1279,6 +1279,8 @@ and rejecting generated posts:
 | `POST` | `/api/v1/content-posts/{id}/approve` | Approve a draft |
 | `POST` | `/api/v1/content-posts/{id}/reject` | Reject a draft |
 | `POST` | `/api/v1/content-posts/{id}/schedule` | Schedule or reschedule an approved post |
+| `POST` | `/api/v1/content-posts/{id}/publish-now` | Publish an approved or scheduled post immediately |
+| `POST` | `/api/v1/content-posts/{id}/cancel-schedule` | Cancel a schedule and return the post to `Approved` |
 | `POST` | `/api/v1/content-posts/{id}/evaluate` | Request a quality evaluation |
 
 All routes require authentication and are scoped to the authenticated user's
@@ -1354,9 +1356,9 @@ Every response uses the standard API envelope. A post payload includes `id`,
 `updatedAt`. Successful edits, regenerations, approvals, and rejections advance
 `updatedAt`; `createdAt` is never changed.
 
-Responses also include two nullable fields describing the publish outcome, both
-maintained by the worker rather than by any request: `publishedAt` and
-`publishFailureReason`. See [Scheduled publishing](#scheduled-publishing).
+Responses also include two nullable fields describing the publish outcome:
+`publishedAt` and `publishFailureReason`. See
+[Scheduled publishing](#scheduled-publishing).
 
 | Code | Condition |
 | --- | --- |
@@ -1378,8 +1380,10 @@ be published.
 }
 ```
 
-Scheduling and scheduled publishing are implemented. There is no request that
-publishes on demand; a post goes out only through its schedule.
+Scheduling and scheduled publishing are implemented. `publish-now` can also
+attempt to publish an approved or scheduled post immediately. The API claims
+the post using the same lease as the worker before calling the shared platform
+publisher, preventing both paths from publishing the same post concurrently.
 
 | Code | Condition |
 | --- | --- |
@@ -1402,6 +1406,26 @@ claimed again when it becomes due.
 
 `scheduledAt` must be strictly in the future. A client cannot set `status` or
 `scheduledAt` through `PATCH`; the update contract exposes only content fields.
+
+#### Immediate publishing
+
+`POST /api/v1/content-posts/{id}/publish-now` takes no request body and accepts
+only `Approved` and `Scheduled` posts. It claims the post atomically, moves an
+approved post into `Scheduled` for the duration of the attempt, and invokes the
+same publisher used by the worker. A successful attempt moves the post to
+`Published`. A failed attempt leaves it `Scheduled` with
+`publishFailureReason`, under the existing claim-expiry retry policy. The
+response contains the updated post and the attempt outcome (`Published`,
+`Failed`, or `Skipped`).
+
+#### Cancelling a schedule
+
+`POST /api/v1/content-posts/{id}/cancel-schedule` takes no request body. It
+returns a `Scheduled` post to `Approved`, clears its scheduled time and any
+previous publish failure, and records `ScheduleCancelled` in the audit log.
+Cancellation uses a conditional update and fails with
+`409 INVALID_CONTENT_POST_TRANSITION` while a publish claim is active. A user
+can schedule the approved post again later.
 
 Responses now include a nullable `scheduledAt`, a nullable `publishedAt`, and a
 nullable `publishFailureReason`. `publishClaimedAt` is internal worker bookkeeping
@@ -1455,9 +1479,9 @@ not from Redis. Redis carries single-use OAuth state and is probed by
 `GET /api/v1/health`; adding a distributed lock layer before a publishing
 subsystem exists would be premature.
 
-Deliberately not implemented: manual publish, unscheduling a post, publication
-history or a per-attempt record, calendar or drag-to-reschedule UX, token
-refresh, and content variants or A/B testing.
+Deliberately not implemented: publication history or a per-attempt record,
+calendar or drag-to-reschedule UX, token refresh, and content variants or A/B
+testing.
 
 #### Quality evaluation
 
@@ -3427,10 +3451,11 @@ PATCH  /schedules/{id}
 DELETE /schedules/{id}
 ```
 
-Publishing has no endpoints. It runs in the scheduled post worker, and its
-outcome is reported on the content post as `status`, `publishedAt`, and
-`publishFailureReason`. `GET /publications*` is deferred; see
-[Publishing](#35-publishing).
+Scheduled publishing runs in the post worker. Authenticated users can also
+publish approved or scheduled content immediately or cancel a schedule through
+the content-post actions documented above. Publication outcome is reported on
+the post as `status`, `publishedAt`, and `publishFailureReason`.
+`GET /publications*` is deferred; see [Publishing](#35-publishing).
 
 ## Analytics
 

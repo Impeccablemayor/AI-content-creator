@@ -16,6 +16,35 @@ public interface IScheduledPostStore
         TimeSpan claimExpiry,
         CancellationToken cancellationToken);
 
+    Task<bool> TryClaimForImmediatePublishAsync(
+        Guid contentPostId,
+        Guid workspaceId,
+        DateTime now,
+        TimeSpan claimExpiry,
+        CancellationToken cancellationToken);
+
+    Task<bool> TryCancelScheduleAsync(
+        Guid contentPostId,
+        Guid workspaceId,
+        DateTime now,
+        TimeSpan claimExpiry,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Atomically schedules an approved post, or reschedules a post that is
+    /// already scheduled. Succeeds only while the post is approved or scheduled
+    /// and holds no un-expired publish claim, so a reschedule can never land
+    /// under an in-flight publish and release the claim that finalises it.
+    /// Returns false when the post is not writable at this instant.
+    /// </summary>
+    Task<bool> TryScheduleAsync(
+        Guid contentPostId,
+        Guid workspaceId,
+        DateTime scheduledAt,
+        DateTime now,
+        TimeSpan claimExpiry,
+        CancellationToken cancellationToken);
+
     /// <summary>
     /// Loads the publishable text for a claimed post, or null when the post no
     /// longer exists.

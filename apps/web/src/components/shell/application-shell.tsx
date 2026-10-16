@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useEffect, useId, useState, type FormEvent, type MouseEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import { ApiClientError } from "@/lib/api/client";
 import { queryKeys } from "@/lib/api/query-keys";
 import { workspaceApi } from "@/lib/api/workspaces";
@@ -34,7 +34,7 @@ const navigation: NavigationGroup[] = [
       { label: "Content", href: "/content", icon: "content" },
       { label: "Ideas", href: "/content/ideas", icon: "idea" },
       { label: "Drafts", href: "/content/drafts", icon: "content" },
-      { label: "Calendar", href: "/calendar", icon: "calendar" },
+      { label: "Calendar", href: "/content/calendar", icon: "calendar" },
     ],
   },
   {
@@ -78,15 +78,18 @@ function NavigationLinks({
   pathname: string;
   onNavigate?: () => void;
 }) {
+  const activeHref = navigation
+    .flatMap((group) => group.items)
+    .filter((item) => pathname === item.href || (item.href !== "/" && pathname.startsWith(`${item.href}/`)))
+    .sort((left, right) => right.href.length - left.href.length)[0]?.href;
+
   return (
     <nav className="nav-groups" aria-label="Primary navigation">
       {navigation.map((group) => (
         <div className="nav-group" key={group.label}>
           <h2 className="nav-group-label">{group.label}</h2>
           {group.items.map((item) => {
-            const active =
-              pathname === item.href ||
-              (item.href !== "/" && pathname.startsWith(`${item.href}/`));
+            const active = item.href === activeHref;
 
             return (
               <Link
@@ -110,6 +113,7 @@ function NavigationLinks({
 function WorkspaceSwitcher({ workspaceId }: { workspaceId: string }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
+  const pickerRef = useRef<HTMLDetailsElement>(null);
   const workspaceNameId = useId();
   const { refreshWorkspaceSession } = useSession();
   const workspacesQuery = useQuery({
@@ -130,6 +134,17 @@ function WorkspaceSwitcher({ workspaceId }: { workspaceId: string }) {
   });
   const activeWorkspace = workspacesQuery.data?.find((workspace) => workspace.isCurrent);
 
+  useEffect(() => {
+    function closeOnOutsidePointer(event: PointerEvent) {
+      if (!(event.target instanceof Node) || !pickerRef.current?.contains(event.target)) {
+        pickerRef.current?.removeAttribute("open");
+      }
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, []);
+
   function submitWorkspace(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = workspaceName.trim();
@@ -142,7 +157,7 @@ function WorkspaceSwitcher({ workspaceId }: { workspaceId: string }) {
 
   return (
     <>
-      <details className="workspace-picker">
+      <details className="workspace-picker" ref={pickerRef}>
         <summary className="workspace-trigger" aria-label="Choose active workspace">
           <span className="workspace-trigger-copy">
             <span className="workspace-trigger-label">Current workspace</span>
@@ -357,6 +372,8 @@ function MobileNavigation({
           type="button"
           label="Open navigation"
           icon="menu"
+          aria-expanded={open}
+          aria-controls="mobile-navigation-dialog"
           onClick={() => setOpen(true)}
         />
         <span className="mobile-brand">MAYORX</span>
@@ -364,6 +381,7 @@ function MobileNavigation({
       </div>
       <div className="mobile-navigation">
         <Dialog
+          id="mobile-navigation-dialog"
           open={open}
           title="Navigation"
           onClose={() => setOpen(false)}
@@ -385,7 +403,10 @@ export function ApplicationShell({ children }: { children: ReactNode }) {
   const { status, session, error, retry } = useSession();
   const isAuthRoute = pathname === "/login" || pathname === "/register";
   const pageTitle =
-    navigation.flatMap((group) => group.items).find((item) => item.href === pathname)?.label ??
+    navigation
+      .flatMap((group) => group.items)
+      .filter((item) => pathname === item.href || (item.href !== "/" && pathname.startsWith(`${item.href}/`)))
+      .sort((left, right) => right.href.length - left.href.length)[0]?.label ??
     "Workspace";
 
   useEffect(() => {

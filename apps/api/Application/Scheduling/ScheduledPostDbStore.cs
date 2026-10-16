@@ -54,6 +54,87 @@ public sealed class ScheduledPostDbStore(AppDbContext dbContext) : IScheduledPos
         return affected == 1;
     }
 
+    public async Task<bool> TryClaimForImmediatePublishAsync(
+        Guid contentPostId,
+        Guid workspaceId,
+        DateTime now,
+        TimeSpan claimExpiry,
+        CancellationToken cancellationToken)
+    {
+        var claimExpiredBefore = now - claimExpiry;
+        var affected = await dbContext.ContentPosts
+            .Where(post =>
+                post.Id == contentPostId &&
+                post.WorkspaceId == workspaceId &&
+                (post.Status == ContentPostStatus.Approved ||
+                 post.Status == ContentPostStatus.Scheduled) &&
+                (post.PublishClaimedAt == null || post.PublishClaimedAt <= claimExpiredBefore))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(post => post.Status, ContentPostStatus.Scheduled)
+                    .SetProperty(post => post.ScheduledAt, now)
+                    .SetProperty(post => post.PublishClaimedAt, now)
+                    .SetProperty(post => post.PublishFailureReason, (PublishFailureReason?)null)
+                    .SetProperty(post => post.UpdatedAt, now),
+                cancellationToken);
+
+        return affected == 1;
+    }
+
+    public async Task<bool> TryCancelScheduleAsync(
+        Guid contentPostId,
+        Guid workspaceId,
+        DateTime now,
+        TimeSpan claimExpiry,
+        CancellationToken cancellationToken)
+    {
+        var claimExpiredBefore = now - claimExpiry;
+        var affected = await dbContext.ContentPosts
+            .Where(post =>
+                post.Id == contentPostId &&
+                post.WorkspaceId == workspaceId &&
+                post.Status == ContentPostStatus.Scheduled &&
+                (post.PublishClaimedAt == null || post.PublishClaimedAt <= claimExpiredBefore))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(post => post.Status, ContentPostStatus.Approved)
+                    .SetProperty(post => post.ScheduledAt, (DateTime?)null)
+                    .SetProperty(post => post.PublishClaimedAt, (DateTime?)null)
+                    .SetProperty(post => post.PublishFailureReason, (PublishFailureReason?)null)
+                    .SetProperty(post => post.UpdatedAt, now),
+                cancellationToken);
+
+        return affected == 1;
+    }
+
+    public async Task<bool> TryScheduleAsync(
+        Guid contentPostId,
+        Guid workspaceId,
+        DateTime scheduledAt,
+        DateTime now,
+        TimeSpan claimExpiry,
+        CancellationToken cancellationToken)
+    {
+        var claimExpiredBefore = now - claimExpiry;
+        var affected = await dbContext.ContentPosts
+            .Where(post =>
+                post.Id == contentPostId &&
+                post.WorkspaceId == workspaceId &&
+                (post.Status == ContentPostStatus.Approved ||
+                 post.Status == ContentPostStatus.Scheduled) &&
+                (post.PublishClaimedAt == null || post.PublishClaimedAt <= claimExpiredBefore))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(post => post.Status, ContentPostStatus.Scheduled)
+                    .SetProperty(post => post.ScheduledAt, scheduledAt)
+                    .SetProperty(post => post.PublishClaimedAt, (DateTime?)null)
+                    .SetProperty(post => post.PublishFailureReason, (PublishFailureReason?)null)
+                    .SetProperty(post => post.UpdatedAt, now),
+                cancellationToken);
+
+        return affected == 1;
+    }
+
     public async Task<ScheduledPostPayload?> GetPublishPayloadAsync(
         Guid contentPostId,
         CancellationToken cancellationToken) =>

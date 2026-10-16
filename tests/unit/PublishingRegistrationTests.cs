@@ -119,6 +119,18 @@ public sealed class PublishingRegistrationTests
             Guid contentPostId, DateTime now, TimeSpan claimExpiry, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public Task<bool> TryClaimForImmediatePublishAsync(
+            Guid contentPostId, Guid workspaceId, DateTime now, TimeSpan claimExpiry, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<bool> TryCancelScheduleAsync(
+            Guid contentPostId, Guid workspaceId, DateTime now, TimeSpan claimExpiry, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<bool> TryScheduleAsync(
+            Guid contentPostId, Guid workspaceId, DateTime scheduledAt, DateTime now, TimeSpan claimExpiry, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public Task<ScheduledPostPayload?> GetPublishPayloadAsync(
             Guid contentPostId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();

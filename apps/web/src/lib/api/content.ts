@@ -8,6 +8,7 @@ import type {
   ContentPostStatus,
   GenerateContentIdeasRequest,
   GenerateContentPostRequest,
+  PublishNowResponse,
   ScheduleContentPostRequest,
   UpdateContentPostRequest,
 } from "./models";
@@ -46,6 +47,16 @@ export const postsApi = {
     apiRequest<ContentPost>(`/content-posts/${id}/reject`, jsonRequest("POST")),
   schedule: (id: string, request: ScheduleContentPostRequest) =>
     apiRequest<ContentPost>(`/content-posts/${id}/schedule`, jsonRequest("POST", request)),
+  publishNow: (id: string) =>
+    apiRequest<PublishNowResponse>(
+      `/content-posts/${id}/publish-now`,
+      jsonRequest("POST"),
+    ),
+  cancelSchedule: (id: string) =>
+    apiRequest<ContentPost>(
+      `/content-posts/${id}/cancel-schedule`,
+      jsonRequest("POST"),
+    ),
   evaluate: (id: string) =>
     apiRequest<ContentEvaluation>(`/content-posts/${id}/evaluate`, jsonRequest("POST")),
 };

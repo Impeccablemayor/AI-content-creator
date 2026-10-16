@@ -17,6 +17,7 @@ using Api.Application.ContentEvaluation;
 using Api.Application.ContentIdeas;
 using Api.Application.ContentPillars;
 using Api.Application.Learning;
+using Api.Application.Publishing;
 using Api.Application.Scheduling;
 using Api.Application.Security;
 using Api.Application.Services;
@@ -409,18 +410,17 @@ builder.Services
     .ValidateOnStart();
 
 builder.Services.AddScoped<IContentPostService, ContentPostService>();
+builder.Services.AddScoped<IScheduledPostStore, ScheduledPostDbStore>();
+builder.Services.AddSocialPublishing(builder.Configuration);
+builder.Services.AddScoped<IContentPostPublishingActions, ContentPostPublishingActions>();
 builder.Services.AddScoped<IAiRunRecorder, AiRunRecorder>();
 builder.Services.AddSingleton<ContentIdeaPromptBuilder>();
 builder.Services.AddSingleton<ContentPostPromptBuilder>();
 builder.Services.AddSingleton<ContentEvaluationPromptBuilder>();
 builder.Services.AddSingleton<ContentRepetitionDetector>();
 
-// Scheduling and publishing are deliberately absent here. The worker owns both:
-// it is the only host that needs AddSocialPublishing, and the only host that
-// runs ScheduledPostWorkerService. Registering the processor in the API created
-// a dependency on IScheduledPostPublishService, which only the worker registers,
-// so the API could not build. Nothing in the API resolves either interface, so
-// nothing is lost by leaving them to the worker.
+// The API can claim and publish an explicit user request. Scheduled discovery
+// remains worker-owned; the API does not run the scheduled-post processor.
 
 builder.Services.AddScoped<IPublishedPostMetricsReader, PublishedPostMetricsReader>();
 builder.Services.AddScoped<IAnalyticsService, AnalyticsService>();

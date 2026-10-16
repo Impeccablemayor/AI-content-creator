@@ -11,9 +11,9 @@ namespace Api.Application.Publishing;
 public static class PublishingRegistration
 {
     /// <summary>
-    /// Registers publishing. The worker calls this instead of the API's
-    /// connection registration, because a worker never accepts an OAuth callback
-    /// and has no state store to keep.
+    /// Registers the shared platform publisher clients and publish service.
+    /// Both the API's explicit publish action and the worker use this
+    /// registration; only the worker runs scheduled-post discovery.
     /// </summary>
     public static IServiceCollection AddSocialPublishing(
         this IServiceCollection services,

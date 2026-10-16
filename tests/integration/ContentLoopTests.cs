@@ -228,6 +228,124 @@ public sealed class ContentLoopTests : IClassFixture<MayorxApiFactory>, IAsyncLi
             response.Headers.GetValues("X-Correlation-Id").Single()));
     }
 
+    [Fact]
+    public async Task Rescheduling_is_refused_while_a_publish_claim_is_active()
+    {
+        var session = await TestSession.RegisterAsync(_browser, "claim");
+        var posts = await SeedTwoDraftPostsAsync(session.WorkspaceId);
+        var post = posts[0];
+        await ApproveAndScheduleAsync(_browser, [post]);
+
+        var original = (await LoadPostsAsync([post.Id])).Single();
+
+        // A worker owns this post right now: a fresh claim means its publish is
+        // in flight, so the user must not be able to reschedule under it.
+        await SetClaimAsync(post.Id, DateTime.UtcNow.AddMinutes(-2));
+
+        var response = await _browser.PostAsync(
+            $"api/v1/content-posts/{post.Id}/schedule",
+            new { scheduledAt = DateTimeOffset.UtcNow.AddDays(1) });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("currently being published", body);
+
+        var stored = (await LoadPostsAsync([post.Id])).Single();
+        Assert.Equal(ContentPostStatus.Scheduled, stored.Status);
+        Assert.NotNull(stored.PublishClaimedAt);
+        Assert.Equal(original.ScheduledAt, stored.ScheduledAt);
+    }
+
+    [Fact]
+    public async Task Rescheduling_is_allowed_after_the_claim_expires()
+    {
+        var session = await TestSession.RegisterAsync(_browser, "expiry");
+        var posts = await SeedTwoDraftPostsAsync(session.WorkspaceId);
+        var post = posts[1];
+        await ApproveAndScheduleAsync(_browser, [post]);
+
+        // An expired claim means the stale worker no longer owns the post, so a
+        // reschedule can safely take it over.
+        await SetClaimAsync(post.Id, DateTime.UtcNow.AddMinutes(-30));
+
+        var newTime = DateTimeOffset.UtcNow.AddDays(2);
+        var rescheduled = await _browser.PostAsync(
+            $"api/v1/content-posts/{post.Id}/schedule",
+            new { scheduledAt = newTime });
+        TestHttp.EnsureSucceeded(
+            rescheduled,
+            await TestHttp.ReadAsync<ContentPostResponse>(rescheduled));
+
+        var stored = (await LoadPostsAsync([post.Id])).Single();
+        Assert.Equal(ContentPostStatus.Scheduled, stored.Status);
+        Assert.True(
+            (stored.ScheduledAt!.Value - newTime.UtcDateTime).Duration() <
+            TimeSpan.FromMilliseconds(1),
+            $"Expected {newTime.UtcDateTime} but the database stored {stored.ScheduledAt}.");
+        Assert.Null(stored.PublishClaimedAt);
+    }
+
+    [Fact]
+    public async Task A_rescheduled_post_is_still_published_by_the_worker()
+    {
+        var session = await TestSession.RegisterAsync(_browser, "reschedule");
+        var posts = await SeedTwoDraftPostsAsync(session.WorkspaceId);
+        var post = posts[0];
+        await ApproveAndScheduleAsync(_browser, [post]);
+
+        // Reschedule to a new time over HTTP before the worker sees it.
+        var newTime = DateTimeOffset.UtcNow.AddHours(3);
+        var rescheduled = await _browser.PostAsync(
+            $"api/v1/content-posts/{post.Id}/schedule",
+            new { scheduledAt = newTime });
+        TestHttp.EnsureSucceeded(
+            rescheduled,
+            await TestHttp.ReadAsync<ContentPostResponse>(rescheduled));
+
+        await SetScheduledAtAsync(post.Id, DateTime.UtcNow.AddMinutes(-1));
+
+        var publishRun = await _factory.RunScheduledPostProcessorAsync();
+
+        Assert.Equal(1, publishRun.Published);
+        var stored = (await LoadPostsAsync([post.Id])).Single();
+        Assert.Equal(ContentPostStatus.Published, stored.Status);
+        Assert.NotNull(stored.PublishedAt);
+        Assert.Null(stored.PublishClaimedAt);
+
+        // Remove the row this workspace produced. The flow test in this class
+        // counts published posts across every workspace in the shared database,
+        // and would otherwise see this post in its analytics run.
+        await _factory.RunWorkerStepAsync(services =>
+        {
+            var dbContext = services.GetRequiredService<AppDbContext>();
+            return dbContext.ContentPosts
+                .Where(item => item.Id == post.Id)
+                .ExecuteDeleteAsync();
+        });
+    }
+
+    private async Task SetClaimAsync(Guid postId, DateTime claimedAt)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        await dbContext.ContentPosts
+            .Where(post => post.Id == postId)
+            .ExecuteUpdateAsync(setters =>
+                setters.SetProperty(post => post.PublishClaimedAt, claimedAt));
+    }
+
+    private async Task SetScheduledAtAsync(Guid postId, DateTime scheduledAt)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        await dbContext.ContentPosts
+            .Where(post => post.Id == postId)
+            .ExecuteUpdateAsync(setters =>
+                setters.SetProperty(post => post.ScheduledAt, scheduledAt));
+    }
+
     private async Task<IReadOnlyList<ContentPost>> SeedTwoDraftPostsAsync(
         Guid workspaceId)
     {

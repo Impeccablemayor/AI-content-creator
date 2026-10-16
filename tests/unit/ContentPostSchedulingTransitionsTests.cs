@@ -17,6 +17,28 @@ public sealed class ContentPostSchedulingTransitionsTests
         bool expected) =>
         Assert.Equal(expected, ContentPostStatusTransitions.CanSchedule(status));
 
+    [Theory]
+    [InlineData(ContentPostStatus.Approved, true)]
+    [InlineData(ContentPostStatus.Scheduled, true)]
+    [InlineData(ContentPostStatus.Draft, false)]
+    [InlineData(ContentPostStatus.Rejected, false)]
+    [InlineData(ContentPostStatus.Published, false)]
+    public void Only_approved_or_scheduled_posts_can_be_published_immediately(
+        ContentPostStatus status,
+        bool expected) =>
+        Assert.Equal(expected, ContentPostStatusTransitions.CanPublishImmediately(status));
+
+    [Theory]
+    [InlineData(ContentPostStatus.Scheduled, true)]
+    [InlineData(ContentPostStatus.Approved, false)]
+    [InlineData(ContentPostStatus.Draft, false)]
+    [InlineData(ContentPostStatus.Rejected, false)]
+    [InlineData(ContentPostStatus.Published, false)]
+    public void Only_scheduled_posts_can_have_their_schedule_cancelled(
+        ContentPostStatus status,
+        bool expected) =>
+        Assert.Equal(expected, ContentPostStatusTransitions.CanCancelSchedule(status));
+
     [Fact]
     public void Scheduling_never_opens_up_the_review_transitions()
     {

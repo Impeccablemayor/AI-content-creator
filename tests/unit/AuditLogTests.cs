@@ -17,6 +17,7 @@ using Api.Domain.Enums;
 using Api.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -377,6 +378,8 @@ public sealed class AuditLogTests
     private static AppDbContext CreateDbContext() =>
         new(new DbContextOptionsBuilder<AppDbContext>()
             .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .ConfigureWarnings(warnings => warnings
+                .Ignore(InMemoryEventId.TransactionIgnoredWarning))
             .Options);
 
     private static IAuditLogService CreateAuditService(
@@ -407,6 +410,7 @@ public sealed class AuditLogTests
             new ContentPostPromptBuilder(),
             new ContentEvaluationPromptBuilder(),
             new ContentRepetitionDetector(),
+            new SchedulingSucceedsScheduledPostStore(),
             NullLogger<ContentPostService>.Instance,
             Options.Create(new AiOptions
             {
@@ -414,7 +418,8 @@ public sealed class AuditLogTests
                 Model = "test-model",
                 ApiKey = "test-placeholder"
             }),
-            Options.Create(new ContentQualityOptions()));
+            Options.Create(new ContentQualityOptions()),
+            Options.Create(new SchedulingOptions()));
 
     private static SocialAccountService CreateSocialService(
         AppDbContext dbContext,

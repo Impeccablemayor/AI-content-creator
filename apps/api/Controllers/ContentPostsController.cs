@@ -1,4 +1,5 @@
 using Api.Application.ContentPosts;
+using Api.Application.Publishing;
 using Api.Contracts.ContentPost;
 using Api.Contracts.Responses;
 using Api.Domain.Enums;
@@ -13,10 +14,14 @@ namespace Api.Controllers;
 public sealed class ContentPostsController : ControllerBase
 {
     private readonly IContentPostService _contentPostService;
+    private readonly IContentPostPublishingActions _publishingActions;
 
-    public ContentPostsController(IContentPostService contentPostService)
+    public ContentPostsController(
+        IContentPostService contentPostService,
+        IContentPostPublishingActions publishingActions)
     {
         _contentPostService = contentPostService;
+        _publishingActions = publishingActions;
     }
 
     [HttpGet]
@@ -212,6 +217,68 @@ public sealed class ContentPostsController : ControllerBase
             Data = post,
             Message = "Content post scheduled successfully."
         });
+    }
+
+    [HttpPost("{id:guid}/publish-now")]
+    [ProducesResponseType(typeof(ApiResponse<PublishNowResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> PublishNow(
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await _publishingActions.PublishNowAsync(id, cancellationToken);
+            if (result is null)
+            {
+                return NotFound(CreateError(
+                    "CONTENT_POST_NOT_FOUND",
+                    "The content post was not found."));
+            }
+
+            return Ok(new ApiResponse<PublishNowResponse>
+            {
+                Data = result,
+                Message = result.Outcome == "Published"
+                    ? "Content post published successfully."
+                    : "The publish attempt did not complete."
+            });
+        }
+        catch (InvalidContentPostTransitionException exception)
+        {
+            return Conflict(CreateError("INVALID_CONTENT_POST_TRANSITION", exception.Message));
+        }
+    }
+
+    [HttpPost("{id:guid}/cancel-schedule")]
+    [ProducesResponseType(typeof(ApiResponse<ContentPostResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> CancelSchedule(
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var post = await _publishingActions.CancelScheduleAsync(id, cancellationToken);
+            if (post is null)
+            {
+                return NotFound(CreateError(
+                    "CONTENT_POST_NOT_FOUND",
+                    "The content post was not found."));
+            }
+
+            return Ok(new ApiResponse<ContentPostResponse>
+            {
+                Data = post,
+                Message = "Schedule cancelled and post returned to Approved."
+            });
+        }
+        catch (InvalidContentPostTransitionException exception)
+        {
+            return Conflict(CreateError("INVALID_CONTENT_POST_TRANSITION", exception.Message));
+        }
     }
 
     [HttpPost("{id:guid}/evaluate")]

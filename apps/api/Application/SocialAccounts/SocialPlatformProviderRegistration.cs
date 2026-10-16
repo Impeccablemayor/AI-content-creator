@@ -35,6 +35,11 @@ public static class SocialPlatformProviderRegistration
                 "X OAuth configuration is incomplete or invalid. Provide ClientId, ClientSecret, a valid RedirectUri, at least one scope, and absolute HTTPS endpoints, or leave the platform unconfigured.")
             .ValidateOnStart();
 
+        services.AddSingleton(serviceProvider =>
+            serviceProvider.GetRequiredService<IOptions<LinkedInOptions>>().Value);
+        services.AddSingleton(serviceProvider =>
+            serviceProvider.GetRequiredService<IOptions<XOptions>>().Value);
+
         services.AddHttpClient<LinkedInSocialPlatformProvider>((serviceProvider, client) =>
                 ConfigureClient(
                     client,

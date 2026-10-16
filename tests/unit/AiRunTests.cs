@@ -738,10 +738,12 @@ public sealed class AiRunTests
             AiRunTestContext.Create(dbContext, workspaceId),
             new ContentPostPromptBuilder(),
             new ContentEvaluationPromptBuilder(),
-            new ContentRepetitionDetector(),
+new ContentRepetitionDetector(),
+            new NotSchedulingScheduledPostStore(),
             NullLogger<ContentPostService>.Instance,
             Options.Create(TestAiOptions()),
-            Options.Create(new ContentQualityOptions()));
+            Options.Create(new ContentQualityOptions()),
+            Options.Create(new SchedulingOptions()));
 
     private static async Task<Guid> SeedGenerationContextAsync(AppDbContext dbContext)
     {

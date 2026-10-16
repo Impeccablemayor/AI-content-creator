@@ -7,6 +7,7 @@ import { ideasApi, postsApi } from "@/lib/api/content";
 import { learningApi } from "@/lib/api/learning";
 import { queryKeys } from "@/lib/api/query-keys";
 import { socialApi } from "@/lib/api/social";
+import { workspaceApi } from "@/lib/api/workspaces";
 import type {
   ContentIdeaStatus,
   ContentPlatform,
@@ -14,12 +15,14 @@ import type {
   CreateContentPillarRequest,
   GenerateContentIdeasRequest,
   GenerateContentPostRequest,
+  PublishNowResponse,
   ScheduleContentPostRequest,
   UpdateAudienceProfileRequest,
   UpdateBrandProfileRequest,
   UpdateContentPillarRequest,
   UpdateContentPostRequest,
   UpdateContentStrategyRequest,
+  Workspace,
 } from "@/lib/api/models";
 
 function invalidatePrefix(
@@ -27,6 +30,25 @@ function invalidatePrefix(
   prefix: readonly unknown[],
 ) {
   return queryClient.invalidateQueries({ queryKey: prefix });
+}
+
+export function useCurrentWorkspace(workspaceId: string) {
+  return useQuery({
+    queryKey: queryKeys.currentWorkspace(workspaceId),
+    queryFn: workspaceApi.current,
+    enabled: Boolean(workspaceId),
+  });
+}
+
+export function useUpdateCurrentWorkspace(workspaceId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: workspaceApi.updateCurrent,
+    onSuccess: async (workspace: Workspace) => {
+      queryClient.setQueryData(queryKeys.currentWorkspace(workspaceId), workspace);
+      await invalidatePrefix(queryClient, queryKeys.workspaces(workspaceId));
+    },
+  });
 }
 
 export function useBrandProfile(workspaceId: string) {
@@ -167,11 +189,13 @@ export function useGeneratePostFromIdea(workspaceId: string, ideaId: string) {
 export function useContentPosts(
   workspaceId: string,
   filters: { status?: ContentPostStatus; platform?: ContentPlatform } = {},
+  refetchInterval?: number | false,
 ) {
   return useQuery({
     queryKey: [...queryKeys.posts(workspaceId), filters],
     queryFn: () => postsApi.list(filters),
     enabled: Boolean(workspaceId),
+    refetchInterval,
   });
 }
 
@@ -227,6 +251,28 @@ export function useScheduleContentPost(workspaceId: string, id: string) {
       queryClient.setQueryData([...queryKeys.posts(workspaceId), id], post);
       await invalidatePrefix(queryClient, queryKeys.posts(workspaceId));
     },
+  });
+}
+
+export function usePublishContentPostNow(workspaceId: string, id: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => postsApi.publishNow(id),
+    onSuccess: (result: PublishNowResponse) => {
+      queryClient.setQueryData([...queryKeys.posts(workspaceId), id], result.post);
+    },
+    onSettled: () => invalidatePrefix(queryClient, queryKeys.posts(workspaceId)),
+  });
+}
+
+export function useCancelContentPostSchedule(workspaceId: string, id: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => postsApi.cancelSchedule(id),
+    onSuccess: (post) => {
+      queryClient.setQueryData([...queryKeys.posts(workspaceId), id], post);
+    },
+    onSettled: () => invalidatePrefix(queryClient, queryKeys.posts(workspaceId)),
   });
 }
 

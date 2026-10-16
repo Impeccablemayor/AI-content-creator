@@ -1,3 +1,19 @@
+# Mayorx Content Engine — Web
+
+The browser uses the backend's `/api/v1` endpoints through a same-origin
+Next.js rewrite. Authentication credentials stay in the backend's httpOnly
+cookies; the frontend does not read or persist tokens.
+
+Set the API origin if it differs from the local default:
+
+```powershell
+$env:MAYORX_API_ORIGIN = "http://localhost:5025"
+npm run dev
+```
+
+Set `MAYORX_API_ORIGIN` to the API origin only (without `/api/v1`) and restart
+Next.js after changing it. The default target is `http://localhost:5025`.
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started

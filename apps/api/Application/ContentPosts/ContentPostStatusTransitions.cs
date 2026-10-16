@@ -19,6 +19,12 @@ public static class ContentPostStatusTransitions
     public static bool CanSchedule(ContentPostStatus status) =>
         status is ContentPostStatus.Approved or ContentPostStatus.Scheduled;
 
+    public static bool CanPublishImmediately(ContentPostStatus status) =>
+        status is ContentPostStatus.Approved or ContentPostStatus.Scheduled;
+
+    public static bool CanCancelSchedule(ContentPostStatus status) =>
+        status == ContentPostStatus.Scheduled;
+
     /// <summary>
     /// Only a scheduled post may be published. Publishing is driven by the
     /// worker, so this is the single gate that keeps a draft, approved,

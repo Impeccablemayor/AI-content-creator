@@ -473,6 +473,31 @@ public sealed class ScheduledPostPublishServiceTests
             CancellationToken cancellationToken) =>
             Task.FromResult(true);
 
+        public Task<bool> TryClaimForImmediatePublishAsync(
+            Guid contentPostId,
+            Guid workspaceId,
+            DateTime now,
+            TimeSpan claimExpiry,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(false);
+
+        public Task<bool> TryCancelScheduleAsync(
+            Guid contentPostId,
+            Guid workspaceId,
+            DateTime now,
+            TimeSpan claimExpiry,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(false);
+
+        public Task<bool> TryScheduleAsync(
+            Guid contentPostId,
+            Guid workspaceId,
+            DateTime scheduledAt,
+            DateTime now,
+            TimeSpan claimExpiry,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(false);
+
         public Task<ScheduledPostPayload?> GetPublishPayloadAsync(
             Guid contentPostId,
             CancellationToken cancellationToken) =>

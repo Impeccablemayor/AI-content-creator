@@ -1,6 +1,7 @@
 export const queryKeys = {
   session: ["session"] as const,
   workspaces: (workspaceId: string) => ["workspaces", workspaceId] as const,
+  currentWorkspace: (workspaceId: string) => ["workspace-current", workspaceId] as const,
   brand: (workspaceId: string) => ["brand", workspaceId] as const,
   audience: (workspaceId: string) => ["audience", workspaceId] as const,
   strategy: (workspaceId: string) => ["strategy", workspaceId] as const,
